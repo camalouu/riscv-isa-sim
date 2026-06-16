@@ -48,7 +48,8 @@ For `--all`, the shape is:
 }
 ```
 
-A nonzero exit status means at least one testcase had an execution/extraction error. Successful atom mismatches against an external oracle are not checked by Spike itself.
+A nonzero exit status means at least one testcase had an execution/extraction error.
+Successful atom mismatches against an external oracle are not checked by Spike itself.
 
 ## Main Implementation Choices
 
@@ -78,12 +79,19 @@ This implementation is intentionally calibrated to the current contractgen/IBEX 
 - Testcases are RV32.
 - Register initialization follows contractgen's `ADDI xN, x0, imm` behavior, including 12-bit signed immediate effects.
 - Root oracle files stay outside the Spike clone.
-- The tool reports current base atoms:
-  `RD`, `RS1`, `RS2`, `IMM`, `REG_RS1`, `REG_RS2`, `REG_RD`, `MEM_ADDR`, `MEM_R_DATA`, `MEM_W_DATA`.
+- The tool reports the `BASE,ALIGNED,BRANCH,DEPENDENCIES` atom groups:
+  `FORMAT`, `OPCODE`, `FUNCT3`, `FUNCT7`, `RD`, `RS1`, `RS2`, `IMM`,
+  `REG_RS1`, `REG_RS2`, `REG_RD`, `MEM_ADDR`, `MEM_R_DATA`, `MEM_W_DATA`,
+  `IS_ALIGNED`, `IS_HALF_ALIGNED`, `IS_BRANCH`, `BRANCH_TAKEN`, `NEW_PC`,
+  `RAW_RS1_1` through `RAW_RS1_4`, `RAW_RS2_1` through `RAW_RS2_4`, and
+  `WAW_1` through `WAW_4`.
 - Branch target execution follows the harness-style finite instruction image: out-of-image instruction fetches are modeled as NOPs.
 - If a branch-taken decision differs between the two sides, comparison stops after the branch sample. This matches the observed oracle behavior for the current 1000 IBEX cases.
 - Loads and stores are modeled for atom observation compatibility with the IBEX harness, not as general Spike memory semantics. The custom IBEX `data_mem.sv` returns address-derived read data (`addr % 0x1000`) and exposes byte-enable-masked RVFI memory data; the tool mirrors that convention.
 - Writes to `x0` do not produce `REG_RD`, matching the oracle behavior.
+- `IS_ALIGNED` is computed as `mem_addr[1:0] == 0`; `IS_HALF_ALIGNED` is computed as `mem_addr[1:0] != 3`, matching the Ibex `ctr.sv` helper signals.
+- Branch observations are computed like the Ibex `ctr.sv` helper signals: JAL and JALR are control instructions and are always branch-taken; conditional branch taken-ness is recomputed from the sampled source-register values.
+- Dependency atoms use a four-retirement window, matching `RVFIExtractor.compareDependencies`: `RAW_RS1_d` and `RAW_RS2_d` compare the current source register against the destination register `d` retirements earlier; `WAW_d` compares the current destination against the earlier destination.
 
 ## Shift-Immediate Operand Caveat
 
@@ -123,7 +131,7 @@ Until contractgen's Java ISA model is corrected and oracle files are regenerated
 
 ## Validation
 
-The final validation command was:
+The original base-template validation command was:
 
 ```sh
 build/contract-spike-diff \
@@ -140,6 +148,66 @@ Result:
 summary {'total': 1000, 'failed': 0}
 mismatches 0
 ```
+
+The full-template validation command was:
+
+```sh
+build/contract-spike-diff \
+  --testcases ../12000-IBEX-testcases.json \
+  --all \
+  --json-out /tmp/spike-atoms-12000-full.json
+```
+
+The generated `/tmp/spike-atoms-12000-full.json` was compared externally against `../12000-IBEX-results.json`, whose contract template was generated with:
+
+```text
+-c BASE,ALIGNED,BRANCH,DEPENDENCIES
+```
+
+Result:
+
+```text
+spike summary: {'total': 12000, 'failed': 0}
+oracle testResults: 12000
+oracle ALL_ATOMS: 881
+unique indices compared: 11993
+matching unique indices: 11743
+mismatching unique indices: 250
+mismatching entries lower bound: 250
+```
+
+The 12k generated files contain duplicate testcase indices:
+
+```text
+6000, 7500, 9000, 1500, 10500, 3000, 4500
+```
+
+and missing indices:
+
+```text
+441, 1941, 3441, 4941, 6441, 7941, 9441, 10941
+```
+
+The comparison therefore groups results by testcase index and compares per-index multisets rather than assuming one unique entry per index.
+
+The main remaining mismatch classes are:
+
+```text
+extra Spike ADDI RAW_RS1_4: 89
+extra Spike ADDI WAW_4: 87
+extra Spike ADDI RAW_RS1_2: 86
+extra Spike ADDI RAW_RS1_3: 86
+extra Spike ADDI WAW_2: 86
+extra Spike ADDI WAW_3: 86
+missing Spike SLLI RAW_RS2_1: 32
+missing Spike SRAI RAW_RS2_1: 32
+missing Spike SRLI RAW_RS2_1: 25
+missing Spike SRLI RS2 / extra Spike SRLI IMM: 24
+missing Spike SRAI RS2 / extra Spike SRAI IMM: 24
+missing Spike SLLI RS2 / extra Spike SLLI IMM: 22
+```
+
+The `SLLI/SRLI/SRAI` mismatches are the known shift-immediate modeling issue described above: Spike now treats the shift amount as `IMM` and does not emit `RS2` or `RAW_RS2_*`, while the current Java oracle can still report those atoms because the Java ISA model stores `shamt` in the `rs2` field. The `ADDI` dependency mismatches are concentrated in NOP-like `ADDI x0, x0, 0` instructions and appear to be an Ibex-harness/program-window compatibility issue rather than a Spike execution failure. They should be revisited when contractgen's Java ISA model and the Spike oracle are aligned on whether synthetic padding/NOP instructions are part of the dependency-observation window.
 
 ## Build Notes
 

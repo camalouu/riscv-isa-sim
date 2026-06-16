@@ -475,7 +475,10 @@ decoded_insn decode(uint32_t bits)
     case format_t::r:
       out.rd = (bits >> 7) & 0x1f;
       out.rs1 = (bits >> 15) & 0x1f;
-      out.rs2 = (bits >> 20) & 0x1f;
+      if (out.type == "SLLI" || out.type == "SRLI" || out.type == "SRAI")
+        out.imm = (bits >> 20) & 0x1f;
+      else
+        out.rs2 = (bits >> 20) & 0x1f;
       break;
     case format_t::i:
       out.rd = (bits >> 7) & 0x1f;
@@ -526,6 +529,16 @@ bool is_branch(const decoded_insn& insn)
 {
   return insn.type == "BEQ" || insn.type == "BNE" || insn.type == "BLT" ||
          insn.type == "BGE" || insn.type == "BLTU" || insn.type == "BGEU";
+}
+
+bool is_jump(const decoded_insn& insn)
+{
+  return insn.type == "JAL" || insn.type == "JALR";
+}
+
+bool is_control(const decoded_insn& insn)
+{
+  return is_branch(insn) || is_jump(insn);
 }
 
 uint32_t sext(uint32_t value, unsigned bits)
@@ -618,6 +631,18 @@ uint32_t synthetic_load_rd_value(const decoded_insn& insn, uint32_t addr)
   if (insn.type == "LH") return sext(bus_value & 0xffffu, 16);
   if (insn.type == "LHU") return bus_value & 0xffffu;
   return bus_value;
+}
+
+bool branch_taken(const decoded_insn& insn, uint32_t rs1, uint32_t rs2)
+{
+  if (insn.type == "JAL" || insn.type == "JALR") return true;
+  if (insn.type == "BEQ") return rs1 == rs2;
+  if (insn.type == "BNE") return rs1 != rs2;
+  if (insn.type == "BLT") return static_cast<int32_t>(rs1) < static_cast<int32_t>(rs2);
+  if (insn.type == "BGE") return static_cast<int32_t>(rs1) >= static_cast<int32_t>(rs2);
+  if (insn.type == "BLTU") return rs1 < rs2;
+  if (insn.type == "BGEU") return rs1 >= rs2;
+  return false;
 }
 
 struct sample {
@@ -787,6 +812,26 @@ void compare_value(std::set<atom>& atoms, const decoded_insn& i1, const decoded_
   }
 }
 
+void compare_dependency(std::set<atom>& atoms, const decoded_insn& i1, const decoded_insn& i2,
+                        const decoded_insn& p1, const decoded_insn& p2,
+                        const std::string& observation,
+                        std::optional<uint32_t> r1, std::optional<uint32_t> r2)
+{
+  const bool has1 = r1.has_value() && p1.rd.has_value();
+  const bool has2 = r2.has_value() && p2.rd.has_value();
+  const bool dep1 = has1 && *r1 == *p1.rd;
+  const bool dep2 = has2 && *r2 == *p2.rd;
+
+  if (has1 && has2 && dep1 != dep2) {
+    atoms.insert({i1.type, observation});
+    atoms.insert({i2.type, observation});
+  } else if (has1 && !has2) {
+    atoms.insert({i1.type, observation});
+  } else if (!has1 && has2) {
+    atoms.insert({i2.type, observation});
+  }
+}
+
 std::set<atom> extract_atoms(const std::vector<sample>& left, const std::vector<sample>& right)
 {
   const size_t count = std::min(left.size(), right.size());
@@ -820,9 +865,35 @@ std::set<atom> extract_atoms(const std::vector<sample>& left, const std::vector<
     compare_value(atoms, i1, i2, "MEM_W_DATA", is_store(i1), is_store(i2),
                   left[idx].mem_w_data, right[idx].mem_w_data);
 
-    const bool taken1 = is_branch(i1) && left[idx].next_pc != left[idx].pc + 4;
-    const bool taken2 = is_branch(i2) && right[idx].next_pc != right[idx].pc + 4;
-    if ((is_branch(i1) || is_branch(i2)) && taken1 != taken2)
+    compare_value(atoms, i1, i2, "IS_ALIGNED", is_mem(i1), is_mem(i2),
+                  (left[idx].mem_addr.value_or(0) & 0x3u) == 0,
+                  (right[idx].mem_addr.value_or(0) & 0x3u) == 0);
+    compare_value(atoms, i1, i2, "IS_HALF_ALIGNED", is_mem(i1), is_mem(i2),
+                  (left[idx].mem_addr.value_or(0) & 0x3u) != 3,
+                  (right[idx].mem_addr.value_or(0) & 0x3u) != 3);
+
+    compare_value(atoms, i1, i2, "IS_BRANCH", is_control(i1), is_control(i2),
+                  is_control(i1), is_control(i2));
+    const bool taken1 = branch_taken(i1, static_cast<uint32_t>(left[idx].reg_rs1),
+                                     static_cast<uint32_t>(left[idx].reg_rs2));
+    const bool taken2 = branch_taken(i2, static_cast<uint32_t>(right[idx].reg_rs1),
+                                     static_cast<uint32_t>(right[idx].reg_rs2));
+    compare_value(atoms, i1, i2, "BRANCH_TAKEN", is_control(i1), is_control(i2),
+                  taken1, taken2);
+    compare_value(atoms, i1, i2, "NEW_PC", is_control(i1), is_control(i2),
+                  left[idx].next_pc, right[idx].next_pc);
+
+    for (size_t distance = 1; distance <= 4; distance++) {
+      if (idx < distance) break;
+      const auto p1 = decode(left[idx - distance].instr);
+      const auto p2 = decode(right[idx - distance].instr);
+      const std::string suffix = "_" + std::to_string(distance);
+      compare_dependency(atoms, i1, i2, p1, p2, "RAW_RS1" + suffix, i1.rs1, i2.rs1);
+      compare_dependency(atoms, i1, i2, p1, p2, "RAW_RS2" + suffix, i1.rs2, i2.rs2);
+      compare_dependency(atoms, i1, i2, p1, p2, "WAW" + suffix, i1.rd, i2.rd);
+    }
+
+    if ((is_control(i1) || is_control(i2)) && taken1 != taken2)
       break;
   }
   return atoms;
