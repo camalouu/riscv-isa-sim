@@ -19,3 +19,6 @@ spike_main_CFLAGS = -fPIC
 # This hack adds all symbols from extension.o to spike's dynamic symbol
 # table, which is required for dynamically loaded --extension libraries
 spike_main_LDFLAGS = extension.o
+
+libcontract_spike_atom.so : contract-spike-diff.o libspike_main.a libriscv.a libdisasm.a libsoftfloat.a libfesvr.a libfdt.a extension.o
+	$(LINK) -shared -o $@ extension.o contract-spike-diff.o libspike_main.a libriscv.a libdisasm.a libsoftfloat.a libfesvr.a libfdt.a $(LIBS)

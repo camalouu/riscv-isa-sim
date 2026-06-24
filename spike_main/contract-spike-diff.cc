@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -348,14 +349,9 @@ std::vector<program_insn> parse_program(const json_value& value)
   return out;
 }
 
-std::vector<test_case> parse_testcases(const std::string& path)
+std::vector<test_case> parse_testcases_json(const std::string& json)
 {
-  std::ifstream in(path);
-  if (!in)
-    throw std::runtime_error("Could not open " + path);
-  std::stringstream buffer;
-  buffer << in.rdbuf();
-  json_parser parser(buffer.str());
+  json_parser parser(json);
   const auto root = parser.parse();
   std::vector<test_case> out;
   for (const auto& raw : root.array()) {
@@ -370,6 +366,16 @@ std::vector<test_case> parse_testcases(const std::string& path)
     out.push_back(std::move(tc));
   }
   return out;
+}
+
+std::vector<test_case> parse_testcases(const std::string& path)
+{
+  std::ifstream in(path);
+  if (!in)
+    throw std::runtime_error("Could not open " + path);
+  std::stringstream buffer;
+  buffer << in.rdbuf();
+  return parse_testcases_json(buffer.str());
 }
 
 uint32_t imm_bits(std::optional<int64_t> imm, unsigned bits)
@@ -900,14 +906,16 @@ std::set<atom> extract_atoms(const std::vector<sample>& left, const std::vector<
 }
 
 struct case_result {
+  int ordinal = -1;
   int index = 0;
   std::set<atom> atoms;
   std::optional<std::string> error;
 };
 
-case_result run_case(const test_case& tc, const std::string& isa)
+case_result run_case(const test_case& tc, const std::string& isa, int ordinal = -1)
 {
   case_result result;
+  result.ordinal = ordinal;
   result.index = tc.index;
   try {
     const int retire_count = INIT_COUNT + 1 + tc.max_instruction_count;
@@ -953,11 +961,45 @@ void write_atoms(std::ostream& out, const std::set<atom>& atoms)
 
 void write_result(std::ostream& out, const case_result& result)
 {
-  out << "{\"case_index\":" << result.index << ",\"atoms\":";
+  out << "{\"ordinal\":" << result.ordinal
+      << ",\"case_index\":" << result.index << ",\"atoms\":";
   write_atoms(out, result.atoms);
   if (result.error)
     out << ",\"error\":\"" << json_escape(*result.error) << "\"";
   out << "}";
+}
+
+void write_results(std::ostream& out, const std::vector<case_result>& results)
+{
+  size_t failed = 0;
+  for (const auto& result : results)
+    if (result.error) failed++;
+  out << "{\"cases\":[";
+  for (size_t i = 0; i < results.size(); i++) {
+    if (i) out << ",";
+    write_result(out, results[i]);
+  }
+  out << "],\"summary\":{\"total\":" << results.size()
+      << ",\"failed\":" << failed << "}}\n";
+}
+
+std::string run_testcases_json(const std::string& testcases_json, const std::string& isa,
+                               int ordinal)
+{
+  const auto cases = parse_testcases_json(testcases_json);
+  std::vector<case_result> results;
+  if (ordinal < 0) {
+    results.reserve(cases.size());
+    for (size_t i = 0; i < cases.size(); i++)
+      results.push_back(run_case(cases[i], isa, static_cast<int>(i)));
+  } else {
+    if (static_cast<size_t>(ordinal) >= cases.size())
+      throw std::runtime_error("No testcase with requested ordinal");
+    results.push_back(run_case(cases[ordinal], isa, ordinal));
+  }
+  std::ostringstream out;
+  write_results(out, results);
+  return out.str();
 }
 
 void usage(const char* name)
@@ -968,6 +1010,40 @@ void usage(const char* name)
 }
 
 } // namespace
+
+extern "C" char* contract_spike_atoms_json(const char* testcases_json,
+                                           const char* isa,
+                                           int ordinal)
+{
+  try {
+    if (!testcases_json)
+      throw std::runtime_error("Missing testcase JSON input");
+    const std::string result = run_testcases_json(
+        testcases_json,
+        isa && *isa ? std::string(isa) : std::string("RV32IM_Zicclsm"),
+        ordinal);
+    char* out = static_cast<char*>(std::malloc(result.size() + 1));
+    if (!out)
+      return nullptr;
+    std::memcpy(out, result.c_str(), result.size() + 1);
+    return out;
+  } catch (const std::exception& e) {
+    std::ostringstream out;
+    out << "{\"cases\":[],\"summary\":{\"total\":0,\"failed\":1},\"error\":\""
+        << json_escape(e.what()) << "\"}\n";
+    const std::string result = out.str();
+    char* error = static_cast<char*>(std::malloc(result.size() + 1));
+    if (!error)
+      return nullptr;
+    std::memcpy(error, result.c_str(), result.size() + 1);
+    return error;
+  }
+}
+
+extern "C" void contract_spike_free(char* ptr)
+{
+  std::free(ptr);
+}
 
 int main(int argc, char** argv)
 {
@@ -1018,15 +1094,15 @@ int main(int argc, char** argv)
     std::vector<case_result> results;
     if (all) {
       results.reserve(cases.size());
-      for (const auto& tc : cases)
-        results.push_back(run_case(tc, isa));
+      for (size_t i = 0; i < cases.size(); i++)
+        results.push_back(run_case(cases[i], isa, static_cast<int>(i)));
     } else {
       auto it = std::find_if(cases.begin(), cases.end(), [&](const test_case& tc) {
         return tc.index == *case_index;
       });
       if (it == cases.end())
         throw std::runtime_error("No testcase with requested index");
-      results.push_back(run_case(*it, isa));
+      results.push_back(run_case(*it, isa, static_cast<int>(std::distance(cases.begin(), it))));
     }
 
     std::unique_ptr<std::ofstream> file_out;
@@ -1042,16 +1118,7 @@ int main(int argc, char** argv)
       write_result(*out, results.front());
       *out << "\n";
     } else {
-      size_t failed = 0;
-      for (const auto& result : results)
-        if (result.error) failed++;
-      *out << "{\"cases\":[";
-      for (size_t i = 0; i < results.size(); i++) {
-        if (i) *out << ",";
-        write_result(*out, results[i]);
-      }
-      *out << "],\"summary\":{\"total\":" << results.size()
-           << ",\"failed\":" << failed << "}}\n";
+      write_results(*out, results);
     }
 
     return std::any_of(results.begin(), results.end(), [](const case_result& r) {
