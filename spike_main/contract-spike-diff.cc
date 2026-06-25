@@ -28,9 +28,11 @@
 namespace {
 
 constexpr reg_t TEXT_BASE = 0x1000;
+constexpr reg_t HARNESS_TEXT_BASE = 0x80;
 constexpr size_t MEM_SIZE = 16 * 1024 * 1024;
 constexpr int INIT_COUNT = 31;
 constexpr uint32_t NOP = 0x00000013;
+constexpr size_t DATA_MEM_HISTORY = 32;
 
 struct json_value {
   using object_t = std::map<std::string, json_value>;
@@ -481,10 +483,7 @@ decoded_insn decode(uint32_t bits)
     case format_t::r:
       out.rd = (bits >> 7) & 0x1f;
       out.rs1 = (bits >> 15) & 0x1f;
-      if (out.type == "SLLI" || out.type == "SRLI" || out.type == "SRAI")
-        out.imm = (bits >> 20) & 0x1f;
-      else
-        out.rs2 = (bits >> 20) & 0x1f;
+      out.rs2 = (bits >> 20) & 0x1f;
       break;
     case format_t::i:
       out.rd = (bits >> 7) & 0x1f;
@@ -542,6 +541,11 @@ bool is_jump(const decoded_insn& insn)
   return insn.type == "JAL" || insn.type == "JALR";
 }
 
+bool is_shift_imm(const decoded_insn& insn)
+{
+  return insn.type == "SLLI" || insn.type == "SRLI" || insn.type == "SRAI";
+}
+
 bool is_control(const decoded_insn& insn)
 {
   return is_branch(insn) || is_jump(insn);
@@ -557,7 +561,7 @@ std::optional<uint32_t> semantic_rd_value(const decoded_insn& insn, reg_t pc,
                                           uint32_t rs1, uint32_t rs2)
 {
   const uint32_t imm12 = insn.imm ? sext(*insn.imm, 12) : 0;
-  const uint32_t shamt = insn.imm.value_or(0) & 0x1f;
+  const uint32_t shamt = insn.imm.value_or(insn.rs2.value_or(0)) & 0x1f;
   if (insn.type == "LUI") return insn.imm.value_or(0);
   if (insn.type == "AUIPC") return static_cast<uint32_t>(pc) + insn.imm.value_or(0);
   if (insn.type == "JAL" || insn.type == "JALR") return static_cast<uint32_t>(pc + 4);
@@ -610,27 +614,76 @@ std::optional<uint32_t> semantic_rd_value(const decoded_insn& insn, reg_t pc,
   return std::nullopt;
 }
 
-uint32_t synthetic_load_bus_value(const decoded_insn& insn, uint32_t addr)
+uint32_t byte_mask_for(const decoded_insn& insn, uint32_t addr)
 {
-  const uint32_t value = addr % 0x1000u;
   const unsigned offset = addr & 0x3u;
-  if (insn.type == "LH" || insn.type == "LHU") {
-    if (offset == 2)
-      return 0;
-    return value & 0xffffu;
-  }
-  if (insn.type == "LW")
-    return value;
-  const unsigned bytes = 1;
+  unsigned bytes = 0;
+  if (insn.type == "LB" || insn.type == "LBU" || insn.type == "SB")
+    bytes = 1;
+  else if (insn.type == "LH" || insn.type == "LHU" || insn.type == "SH")
+    bytes = 2;
+  else if (insn.type == "LW" || insn.type == "SW")
+    bytes = 4;
   uint32_t mask = 0;
   for (unsigned i = 0; i < bytes && offset + i < 4; i++)
-    mask |= 0xffu << ((offset + i) * 8);
-  return value & mask;
+    mask |= 1u << (offset + i);
+  return mask;
 }
 
-uint32_t synthetic_load_rd_value(const decoded_insn& insn, uint32_t addr)
+uint32_t apply_byte_enable_mask(uint32_t value, uint32_t byte_mask)
 {
-  const uint32_t bus_value = synthetic_load_bus_value(insn, addr);
+  uint32_t out = 0;
+  for (unsigned i = 0; i < 4; i++) {
+    if (byte_mask & (1u << i))
+      out |= value & (0xffu << (i * 8));
+  }
+  return out;
+}
+
+struct data_mem_model {
+  std::vector<std::pair<uint32_t, uint8_t>> history;
+
+  data_mem_model() : history(DATA_MEM_HISTORY, {0, 0}) {}
+
+  uint32_t load_bus_value(const decoded_insn& insn, uint32_t addr) const
+  {
+    uint32_t value = addr % 0x1000u;
+    const unsigned offset = addr & 0x3u;
+    if (insn.type == "LH" || insn.type == "LHU") {
+      if (offset == 2)
+        return 0;
+      return value & 0xffffu;
+    }
+    if (insn.type == "LW")
+      return value;
+    const uint32_t byte_mask = byte_mask_for(insn, addr);
+    for (const auto& [stored_addr, stored_value] : history) {
+      for (unsigned lane = 0; lane < 4; lane++) {
+        if ((byte_mask & (1u << lane)) && addr + lane == stored_addr) {
+          value &= ~(0xffu << (lane * 8));
+          value |= static_cast<uint32_t>(stored_value) << (lane * 8);
+        }
+      }
+    }
+    return apply_byte_enable_mask(value, byte_mask);
+  }
+
+  void store(const decoded_insn& insn, uint32_t addr, uint32_t value)
+  {
+    const uint32_t byte_mask = byte_mask_for(insn, addr);
+    const unsigned offset = addr & 0x3u;
+    for (unsigned lane = 0; lane < 4; lane++) {
+      if (!(byte_mask & (1u << lane))) continue;
+      const unsigned source_lane = lane >= offset ? lane - offset : lane;
+      const uint8_t byte = static_cast<uint8_t>((value >> (source_lane * 8)) & 0xffu);
+      history.erase(history.begin());
+      history.push_back({addr + lane, byte});
+    }
+  }
+};
+
+uint32_t synthetic_load_rd_value(const decoded_insn& insn, uint32_t bus_value, uint32_t addr)
+{
   const unsigned offset = addr & 0x3u;
   if (insn.type == "LB") return sext((bus_value >> (offset * 8)) & 0xffu, 8);
   if (insn.type == "LBU") return (bus_value >> (offset * 8)) & 0xffu;
@@ -706,6 +759,7 @@ std::vector<sample> run_side(const std::vector<uint32_t>& words, int retire_coun
   processor_t* proc = sim.get_core(0);
   proc->enable_log_commits();
 
+  data_mem_model data_mem;
   std::vector<sample> out;
   out.reserve(retire_count);
   for (int retired = 1; retired <= retire_count; retired++) {
@@ -734,15 +788,16 @@ std::vector<sample> run_side(const std::vector<uint32_t>& words, int retire_coun
       continue;
     }
     if (decoded.rs1) s.reg_rs1 = state->XPR[*decoded.rs1];
-    if (decoded.rs2) s.reg_rs2 = state->XPR[*decoded.rs2];
+    if (decoded.rs2 && !is_shift_imm(decoded)) s.reg_rs2 = state->XPR[*decoded.rs2];
     if (is_mem(decoded) && decoded.imm)
       s.mem_addr = static_cast<uint32_t>(s.reg_rs1) + sext(*decoded.imm, 12);
     if (is_store(decoded))
       s.mem_w_data = s.reg_rs2;
     if (is_load(decoded) && s.mem_addr) {
-      s.mem_r_data = synthetic_load_bus_value(decoded, static_cast<uint32_t>(*s.mem_addr));
+      s.mem_r_data = data_mem.load_bus_value(decoded, static_cast<uint32_t>(*s.mem_addr));
       if (decoded.rd && *decoded.rd != 0)
-        s.reg_rd = synthetic_load_rd_value(decoded, static_cast<uint32_t>(*s.mem_addr));
+        s.reg_rd = synthetic_load_rd_value(decoded, static_cast<uint32_t>(s.mem_r_data),
+                                           static_cast<uint32_t>(*s.mem_addr));
     }
     if (decoded.rd) {
       if (*decoded.rd != 0) {
@@ -777,6 +832,12 @@ std::vector<sample> run_side(const std::vector<uint32_t>& words, int retire_coun
       const auto& item = state->log_mem_write.front();
       s.mem_addr = std::get<0>(item);
       s.mem_w_data = std::get<1>(item);
+    }
+    if (is_store(decoded) && s.mem_addr)
+      data_mem.store(decoded, static_cast<uint32_t>(*s.mem_addr), static_cast<uint32_t>(s.reg_rs2));
+    if (state->pc >= HARNESS_TEXT_BASE &&
+        state->pc < HARNESS_TEXT_BASE + static_cast<reg_t>(words.size() * 4)) {
+      state->pc = TEXT_BASE + (state->pc - HARNESS_TEXT_BASE);
     }
     s.next_pc = state->pc;
     out.push_back(s);
@@ -862,7 +923,10 @@ std::set<atom> extract_atoms(const std::vector<sample>& left, const std::vector<
     if (i1.imm != i2.imm) add_if(atoms, i1, i2, "IMM", i1.imm.has_value(), i2.imm.has_value());
 
     compare_value(atoms, i1, i2, "REG_RS1", i1.rs1.has_value(), i2.rs1.has_value(), left[idx].reg_rs1, right[idx].reg_rs1);
-    compare_value(atoms, i1, i2, "REG_RS2", i1.rs2.has_value(), i2.rs2.has_value(), left[idx].reg_rs2, right[idx].reg_rs2);
+    compare_value(atoms, i1, i2, "REG_RS2",
+                  i1.rs2.has_value() && !is_shift_imm(i1),
+                  i2.rs2.has_value() && !is_shift_imm(i2),
+                  left[idx].reg_rs2, right[idx].reg_rs2);
     compare_value(atoms, i1, i2, "REG_RD", i1.rd.has_value(), i2.rd.has_value(), left[idx].reg_rd, right[idx].reg_rd);
     compare_value(atoms, i1, i2, "MEM_ADDR", is_mem(i1), is_mem(i2),
                   left[idx].mem_addr.value_or(0), right[idx].mem_addr.value_or(0));
@@ -899,7 +963,8 @@ std::set<atom> extract_atoms(const std::vector<sample>& left, const std::vector<
       compare_dependency(atoms, i1, i2, p1, p2, "WAW" + suffix, i1.rd, i2.rd);
     }
 
-    if ((is_control(i1) || is_control(i2)) && taken1 != taken2)
+    if ((is_control(i1) || is_control(i2)) &&
+        (taken1 != taken2 || left[idx].next_pc != right[idx].next_pc))
       break;
   }
   return atoms;
@@ -918,7 +983,7 @@ case_result run_case(const test_case& tc, const std::string& isa, int ordinal = 
   result.ordinal = ordinal;
   result.index = tc.index;
   try {
-    const int retire_count = INIT_COUNT + 1 + tc.max_instruction_count;
+    const int retire_count = INIT_COUNT + tc.max_instruction_count;
     const auto left_words = words_for(tc.registers1, tc.program1, tc.max_instruction_count);
     const auto right_words = words_for(tc.registers2, tc.program2, tc.max_instruction_count);
     const auto left = run_side(left_words, retire_count, isa);
