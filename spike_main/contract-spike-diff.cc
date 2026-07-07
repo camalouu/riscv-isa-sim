@@ -717,13 +717,6 @@ struct sample {
   uint64_t mem_w_data = 0;
 };
 
-std::vector<std::pair<reg_t, abstract_mem_t*>> make_mems(mem_t** mem_out)
-{
-  auto* mem = new mem_t(MEM_SIZE);
-  *mem_out = mem;
-  return {{TEXT_BASE, mem}};
-}
-
 void store_words(mem_t* mem, const std::vector<uint32_t>& words)
 {
   for (size_t i = 0; i < words.size(); i++) {
@@ -739,43 +732,59 @@ void store_words(mem_t* mem, const std::vector<uint32_t>& words)
   }
 }
 
-std::vector<sample> run_side(const std::vector<uint32_t>& words, int retire_count,
-                             const std::string& isa)
-{
-  mem_t* mem = nullptr;
+struct spike_runner {
+  std::string isa_str;
   cfg_t cfg;
-  cfg.isa = isa.c_str();
-  cfg.priv = "M";
-  cfg.mem_layout = {mem_cfg_t(TEXT_BASE, MEM_SIZE)};
-  cfg.start_pc.set_global(TEXT_BASE);
-  auto mems = make_mems(&mem);
-  store_words(mem, words);
-
   std::vector<device_factory_sargs_t> plugin_devices;
   std::vector<std::string> htif_args{"none"};
   debug_module_config_t dm_config;
-  sim_t sim(&cfg, false, mems, plugin_devices, false, htif_args, dm_config,
-            "/dev/null", false, nullptr, false, nullptr, std::nullopt);
-  processor_t* proc = sim.get_core(0);
-  proc->enable_log_commits();
+  mem_t* mem;
+  std::unique_ptr<sim_t> sim;
 
-  data_mem_model data_mem;
-  std::vector<sample> out;
-  out.reserve(retire_count);
-  for (int retired = 1; retired <= retire_count; retired++) {
+  spike_runner(const std::string& isa) : isa_str(isa) {
+    cfg.isa = isa_str.c_str();
+    cfg.priv = "M";
+    cfg.mem_layout = {mem_cfg_t(TEXT_BASE, MEM_SIZE)};
+    cfg.start_pc.set_global(TEXT_BASE);
+    
+    mem = new mem_t(MEM_SIZE);
+    std::vector<std::pair<reg_t, abstract_mem_t*>> mems = {{TEXT_BASE, mem}};
+    
+    sim = std::make_unique<sim_t>(&cfg, false, mems, plugin_devices, false, htif_args, dm_config,
+            "/dev/null", false, nullptr, false, nullptr, std::nullopt);
+    sim->get_core(0)->enable_log_commits();
+  }
+
+  std::vector<sample> run_side(const std::vector<uint32_t>& words, int retire_count) {
+    store_words(mem, words);
+    processor_t* proc = sim->get_core(0);
+    
+    proc->reset();
     state_t* state = proc->get_state();
-    const reg_t pc = state->pc;
-    uint32_t instr = NOP;
-    bool synthetic_nop = pc < TEXT_BASE || pc >= TEXT_BASE + words.size() * 4;
-    if (!synthetic_nop) {
-      try {
-        instr = static_cast<uint32_t>(proc->get_mmu()->load_insn(pc).insn.bits());
-      } catch (trap_t&) {
-        synthetic_nop = true;
-      } catch (trap_debug_mode&) {
-        synthetic_nop = true;
-      }
+    for (int i = 0; i < 32; i++) {
+        state->XPR.write(i, 0);
     }
+    state->log_reg_write.clear();
+    state->log_mem_read.clear();
+    state->log_mem_write.clear();
+    state->pc = TEXT_BASE;
+
+    data_mem_model data_mem;
+    std::vector<sample> out;
+    out.reserve(retire_count);
+    for (int retired = 1; retired <= retire_count; retired++) {
+      const reg_t pc = state->pc;
+      uint32_t instr = NOP;
+      bool synthetic_nop = pc < TEXT_BASE || pc >= TEXT_BASE + words.size() * 4;
+      if (!synthetic_nop) {
+        try {
+          instr = static_cast<uint32_t>(proc->get_mmu()->load_insn(pc).insn.bits());
+        } catch (trap_t&) {
+          synthetic_nop = true;
+        } catch (trap_debug_mode&) {
+          synthetic_nop = true;
+        }
+      }
     const auto decoded = decode(instr);
     sample s;
     s.retire = retired;
@@ -841,11 +850,12 @@ std::vector<sample> run_side(const std::vector<uint32_t>& words, int retire_coun
     }
     s.next_pc = state->pc;
     out.push_back(s);
-    if (step_trapped)
-      break;
+      if (step_trapped)
+        break;
+    }
+    return out;
   }
-  return out;
-}
+};
 
 struct atom {
   std::string type;
@@ -977,7 +987,7 @@ struct case_result {
   std::optional<std::string> error;
 };
 
-case_result run_case(const test_case& tc, const std::string& isa, int ordinal = -1)
+case_result run_case(const test_case& tc, spike_runner& runner, int ordinal = -1)
 {
   case_result result;
   result.ordinal = ordinal;
@@ -986,8 +996,8 @@ case_result run_case(const test_case& tc, const std::string& isa, int ordinal = 
     const int retire_count = INIT_COUNT + tc.max_instruction_count;
     const auto left_words = words_for(tc.registers1, tc.program1, tc.max_instruction_count);
     const auto right_words = words_for(tc.registers2, tc.program2, tc.max_instruction_count);
-    const auto left = run_side(left_words, retire_count, isa);
-    const auto right = run_side(right_words, retire_count, isa);
+    const auto left = runner.run_side(left_words, retire_count);
+    const auto right = runner.run_side(right_words, retire_count);
     result.atoms = extract_atoms(left, right);
   } catch (const std::exception& e) {
     result.error = e.what();
@@ -1053,14 +1063,15 @@ std::string run_testcases_json(const std::string& testcases_json, const std::str
 {
   const auto cases = parse_testcases_json(testcases_json);
   std::vector<case_result> results;
+  spike_runner runner(isa);
   if (ordinal < 0) {
     results.reserve(cases.size());
     for (size_t i = 0; i < cases.size(); i++)
-      results.push_back(run_case(cases[i], isa, static_cast<int>(i)));
+      results.push_back(run_case(cases[i], runner, static_cast<int>(i)));
   } else {
     if (static_cast<size_t>(ordinal) >= cases.size())
       throw std::runtime_error("No testcase with requested ordinal");
-    results.push_back(run_case(cases[ordinal], isa, ordinal));
+    results.push_back(run_case(cases[ordinal], runner, ordinal));
   }
   std::ostringstream out;
   write_results(out, results);
@@ -1157,17 +1168,18 @@ int main(int argc, char** argv)
   try {
     const auto cases = parse_testcases(testcases_path);
     std::vector<case_result> results;
+    spike_runner runner(isa);
     if (all) {
       results.reserve(cases.size());
       for (size_t i = 0; i < cases.size(); i++)
-        results.push_back(run_case(cases[i], isa, static_cast<int>(i)));
+        results.push_back(run_case(cases[i], runner, static_cast<int>(i)));
     } else {
       auto it = std::find_if(cases.begin(), cases.end(), [&](const test_case& tc) {
         return tc.index == *case_index;
       });
       if (it == cases.end())
         throw std::runtime_error("No testcase with requested index");
-      results.push_back(run_case(*it, isa, static_cast<int>(std::distance(cases.begin(), it))));
+      results.push_back(run_case(*it, runner, static_cast<int>(std::distance(cases.begin(), it))));
     }
 
     std::unique_ptr<std::ofstream> file_out;
