@@ -111,15 +111,22 @@ This implementation is intentionally calibrated to the current contractgen/IBEX 
 - Testcases are RV32.
 - Register initialization follows contractgen's `ADDI xN, x0, imm` behavior, including 12-bit signed immediate effects.
 - Root oracle files stay outside the Spike clone.
-- The tool reports the `BASE,ALIGNED,BRANCH,DEPENDENCIES` atom groups:
+- The tool reports the `BASE,ALIGNED,BRANCH,DEPENDENCIES,VALUE` atom groups:
   `FORMAT`, `OPCODE`, `FUNCT3`, `FUNCT7`, `RD`, `RS1`, `RS2`, `IMM`,
   `REG_RS1`, `REG_RS2`, `REG_RD`, `MEM_ADDR`, `MEM_R_DATA`, `MEM_W_DATA`,
   `IS_ALIGNED`, `IS_HALF_ALIGNED`, `IS_BRANCH`, `BRANCH_TAKEN`, `NEW_PC`,
   `RAW_RS1_1` through `RAW_RS1_4`, `RAW_RS2_1` through `RAW_RS2_4`, and
-  `WAW_1` through `WAW_4`.
+  `WAW_1` through `WAW_4`, plus `REG_RS1_ZERO`, `REG_RS2_ZERO`,
+  `REG_RD_ZERO`, `REG_RS1_LOG2`, `REG_RS2_LOG2`, and `REG_RD_LOG2`.
+- ZERO atoms distinguish zero from nonzero and are attributed to the instruction
+  side whose value is zero, matching the Java RVFI extractors. LOG2 atoms compare
+  `floor(log2(value))` over unsigned RV32 values; zero occupies its own sentinel
+  bucket. If only one side has the relevant operand, its instruction receives both
+  corresponding VALUE atoms, again matching the Java extractor behavior.
 - Branch target execution follows the harness-style finite instruction image: out-of-image instruction fetches are modeled as NOPs.
 - If a control-flow observation diverges through taken-ness or next-PC, comparison stops after the control sample. This matches most observed IBEX_TEST oracle behavior and avoids treating later synthetic NOP padding as the primary atom source.
 - Loads and stores are modeled for atom observation compatibility with the IBEX harness, not as general Spike memory semantics. The custom IBEX `data_mem.sv` returns address-derived read data (`addr % 0x1000`) and exposes byte-enable-masked RVFI memory data; the tool mirrors that convention.
+- The synthetic memory values do not replace Spike's actual load/store step. If that step traps because an address is outside Spike's mapped memory, the Spike trace ends while the IBEX harness may continue. Random instruction suffixes amplify this difference: RVFI can report propagated register and memory atoms from the remaining suffix that Spike never samples.
 - Writes to `x0` expose `REG_RD == 0` in the Spike compatibility model. This matches the current oracle better than reporting the computed writeback value for `rd == 0`: changing Spike to report computed `x0` writeback values increased the saved 12k BASE mismatch count from 8 to 101, mostly extra `ADDI/REG_RD`.
 - `IS_ALIGNED` is computed as `mem_addr[1:0] == 0`; `IS_HALF_ALIGNED` is computed as `mem_addr[1:0] != 3`, matching the Ibex `ctr.sv` helper signals.
 - Branch observations are computed like the Ibex `ctr.sv` helper signals: JAL and JALR are control instructions and are always branch-taken; conditional branch taken-ness is recomputed from the sampled source-register values.

@@ -1,0 +1,16 @@
+[
+  {
+    "registers1": {"1": 1},
+    "program1": [
+      {"type": "ADDI", "rd": 2, "rs1": 0, "imm": 0},
+      {"type": "DIVU", "rd": 3, "rs1": 1, "rs2": 2}
+    ],
+    "registers2": {"1": 1},
+    "program2": [
+      {"type": "ADDI", "rd": 2, "rs1": 0, "imm": 1},
+      {"type": "DIVU", "rd": 3, "rs1": 1, "rs2": 2}
+    ],
+    "maxInstructionCount": 3,
+    "index": 0
+  }
+]

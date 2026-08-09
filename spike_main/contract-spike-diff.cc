@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <optional>
 #include <set>
@@ -889,6 +890,44 @@ void compare_value(std::set<atom>& atoms, const decoded_insn& i1, const decoded_
   }
 }
 
+int floor_log2_32(uint64_t value)
+{
+  uint32_t narrowed = static_cast<uint32_t>(value);
+  if (narrowed == 0)
+    return std::numeric_limits<int>::min();
+
+  int result = 0;
+  while (narrowed >>= 1)
+    result++;
+  return result;
+}
+
+void compare_zero(std::set<atom>& atoms, const decoded_insn& i1, const decoded_insn& i2,
+                  const std::string& observation, bool has1, bool has2,
+                  uint64_t v1, uint64_t v2)
+{
+  if (has1 && has2) {
+    const bool zero1 = static_cast<uint32_t>(v1) == 0;
+    const bool zero2 = static_cast<uint32_t>(v2) == 0;
+    if (zero1 && !zero2)
+      atoms.insert({i1.type, observation});
+    else if (!zero1 && zero2)
+      atoms.insert({i2.type, observation});
+  } else if (has1 && !has2) {
+    atoms.insert({i1.type, observation});
+  } else if (!has1 && has2) {
+    atoms.insert({i2.type, observation});
+  }
+}
+
+void compare_log2(std::set<atom>& atoms, const decoded_insn& i1, const decoded_insn& i2,
+                  const std::string& observation, bool has1, bool has2,
+                  uint64_t v1, uint64_t v2)
+{
+  compare_value(atoms, i1, i2, observation, has1, has2,
+                floor_log2_32(v1), floor_log2_32(v2));
+}
+
 void compare_dependency(std::set<atom>& atoms, const decoded_insn& i1, const decoded_insn& i2,
                         const decoded_insn& p1, const decoded_insn& p2,
                         const std::string& observation,
@@ -932,12 +971,32 @@ std::set<atom> extract_atoms(const std::vector<sample>& left, const std::vector<
     if (i1.rs2 != i2.rs2) add_if(atoms, i1, i2, "RS2", i1.rs2.has_value(), i2.rs2.has_value());
     if (i1.imm != i2.imm) add_if(atoms, i1, i2, "IMM", i1.imm.has_value(), i2.imm.has_value());
 
-    compare_value(atoms, i1, i2, "REG_RS1", i1.rs1.has_value(), i2.rs1.has_value(), left[idx].reg_rs1, right[idx].reg_rs1);
+    const bool has_rs1_1 = i1.rs1.has_value();
+    const bool has_rs1_2 = i2.rs1.has_value();
+    const bool has_rs2_1 = i1.rs2.has_value() && !is_shift_imm(i1);
+    const bool has_rs2_2 = i2.rs2.has_value() && !is_shift_imm(i2);
+    const bool has_rd_1 = i1.rd.has_value();
+    const bool has_rd_2 = i2.rd.has_value();
+
+    compare_value(atoms, i1, i2, "REG_RS1", has_rs1_1, has_rs1_2,
+                  left[idx].reg_rs1, right[idx].reg_rs1);
+    compare_zero(atoms, i1, i2, "REG_RS1_ZERO", has_rs1_1, has_rs1_2,
+                 left[idx].reg_rs1, right[idx].reg_rs1);
+    compare_log2(atoms, i1, i2, "REG_RS1_LOG2", has_rs1_1, has_rs1_2,
+                 left[idx].reg_rs1, right[idx].reg_rs1);
     compare_value(atoms, i1, i2, "REG_RS2",
-                  i1.rs2.has_value() && !is_shift_imm(i1),
-                  i2.rs2.has_value() && !is_shift_imm(i2),
+                  has_rs2_1, has_rs2_2,
                   left[idx].reg_rs2, right[idx].reg_rs2);
-    compare_value(atoms, i1, i2, "REG_RD", i1.rd.has_value(), i2.rd.has_value(), left[idx].reg_rd, right[idx].reg_rd);
+    compare_zero(atoms, i1, i2, "REG_RS2_ZERO", has_rs2_1, has_rs2_2,
+                 left[idx].reg_rs2, right[idx].reg_rs2);
+    compare_log2(atoms, i1, i2, "REG_RS2_LOG2", has_rs2_1, has_rs2_2,
+                 left[idx].reg_rs2, right[idx].reg_rs2);
+    compare_value(atoms, i1, i2, "REG_RD", has_rd_1, has_rd_2,
+                  left[idx].reg_rd, right[idx].reg_rd);
+    compare_zero(atoms, i1, i2, "REG_RD_ZERO", has_rd_1, has_rd_2,
+                 left[idx].reg_rd, right[idx].reg_rd);
+    compare_log2(atoms, i1, i2, "REG_RD_LOG2", has_rd_1, has_rd_2,
+                 left[idx].reg_rd, right[idx].reg_rd);
     compare_value(atoms, i1, i2, "MEM_ADDR", is_mem(i1), is_mem(i2),
                   left[idx].mem_addr.value_or(0), right[idx].mem_addr.value_or(0));
     compare_value(atoms, i1, i2, "MEM_R_DATA", is_load(i1), is_load(i2),
