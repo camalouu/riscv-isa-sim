@@ -648,15 +648,7 @@ struct data_mem_model {
 
   uint32_t load_bus_value(const decoded_insn& insn, uint32_t addr) const
   {
-    uint32_t value = addr % 0x1000u;
-    const unsigned offset = addr & 0x3u;
-    if (insn.type == "LH" || insn.type == "LHU") {
-      if (offset == 2)
-        return 0;
-      return value & 0xffffu;
-    }
-    if (insn.type == "LW")
-      return value;
+    uint32_t value = 0;
     const uint32_t byte_mask = byte_mask_for(insn, addr);
     for (const auto& [stored_addr, stored_value] : history) {
       for (unsigned lane = 0; lane < 4; lane++) {
@@ -817,42 +809,36 @@ struct spike_runner {
       }
     }
 
-    bool step_trapped = false;
-    try {
-      proc->step(1);
-    } catch (trap_t&) {
-      step_trapped = true;
-    } catch (trap_debug_mode&) {
-      step_trapped = true;
-    }
-
-    for (const auto& write : state->log_reg_write) {
-      if ((write.first & 0xf) == 0) {
-        const uint32_t rd = write.first >> 4;
-        if (decoded.rd && rd == *decoded.rd && rd != 0)
-          s.reg_rd = write.second.v[0];
-      }
-    }
-    if (!state->log_mem_read.empty()) {
-      const auto& item = state->log_mem_read.front();
-      s.mem_addr = std::get<0>(item);
-      s.mem_r_data = std::get<1>(item);
-    }
-    if (!state->log_mem_write.empty()) {
-      const auto& item = state->log_mem_write.front();
-      s.mem_addr = std::get<0>(item);
-      s.mem_w_data = std::get<1>(item);
-    }
+    // Execute against the bounded sparse-memory model so arbitrary generated
+    // data addresses do not terminate replay through Spike's MMU.
+    if (decoded.rd && *decoded.rd != 0)
+      state->XPR.write(*decoded.rd, s.reg_rd);
     if (is_store(decoded) && s.mem_addr)
       data_mem.store(decoded, static_cast<uint32_t>(*s.mem_addr), static_cast<uint32_t>(s.reg_rs2));
-    if (state->pc >= HARNESS_TEXT_BASE &&
+
+    reg_t next_pc = pc + 4;
+    bool remap_harness_address = false;
+    if (is_branch(decoded) && branch_taken(decoded, static_cast<uint32_t>(s.reg_rs1),
+                                           static_cast<uint32_t>(s.reg_rs2)))
+      next_pc = static_cast<uint32_t>(static_cast<uint32_t>(pc) + sext(decoded.imm.value_or(0), 13));
+    else if (decoded.type == "JAL")
+      next_pc = static_cast<uint32_t>(static_cast<uint32_t>(pc) + sext(decoded.imm.value_or(0), 21));
+    else if (decoded.type == "JALR")
+    {
+      next_pc = static_cast<uint32_t>(static_cast<uint32_t>(s.reg_rs1)
+                 + sext(decoded.imm.value_or(0), 12)) & ~uint32_t(1);
+      remap_harness_address = true;
+    }
+    state->pc = next_pc;
+    // PC-relative branches and JAL keep the same displacement after relocating
+    // the image to TEXT_BASE. Only absolute JALR targets use harness addresses
+    // and therefore need the 0x80 -> TEXT_BASE translation.
+    if (remap_harness_address && state->pc >= HARNESS_TEXT_BASE &&
         state->pc < HARNESS_TEXT_BASE + static_cast<reg_t>(words.size() * 4)) {
       state->pc = TEXT_BASE + (state->pc - HARNESS_TEXT_BASE);
     }
     s.next_pc = state->pc;
     out.push_back(s);
-      if (step_trapped)
-        break;
     }
     return out;
   }
@@ -866,6 +852,21 @@ struct atom {
   {
     return std::tie(type, observation) < std::tie(other.type, other.observation);
   }
+};
+
+struct instruction_pair {
+  std::string left;
+  std::string right;
+
+  bool operator<(const instruction_pair& other) const
+  {
+    return std::tie(left, right) < std::tie(other.left, other.right);
+  }
+};
+
+struct extracted_evidence {
+  std::map<atom, int> atoms;
+  std::map<instruction_pair, int> instruction_pairs;
 };
 
 void add_if(std::set<atom>& atoms, const decoded_insn& i1, const decoded_insn& i2,
@@ -948,13 +949,18 @@ void compare_dependency(std::set<atom>& atoms, const decoded_insn& i1, const dec
   }
 }
 
-std::set<atom> extract_atoms(const std::vector<sample>& left, const std::vector<sample>& right)
+extracted_evidence extract_evidence(const std::vector<sample>& left, const std::vector<sample>& right)
 {
   const size_t count = std::min(left.size(), right.size());
-  std::set<atom> atoms;
+  extracted_evidence evidence;
   for (size_t idx = INIT_COUNT; idx < count; idx++) {
+    std::set<atom> atoms;
     const auto i1 = decode(left[idx].instr);
     const auto i2 = decode(right[idx].instr);
+    const int retire = static_cast<int>(idx) + 1;
+
+    if (i1.type != i2.type)
+      evidence.instruction_pairs.emplace(instruction_pair{i1.type, i2.type}, retire);
 
     if (i1.format != i2.format) {
       atoms.insert({i1.type, "FORMAT"});
@@ -1032,17 +1038,17 @@ std::set<atom> extract_atoms(const std::vector<sample>& left, const std::vector<
       compare_dependency(atoms, i1, i2, p1, p2, "WAW" + suffix, i1.rd, i2.rd);
     }
 
-    if ((is_control(i1) || is_control(i2)) &&
-        (taken1 != taken2 || left[idx].next_pc != right[idx].next_pc))
-      break;
+    for (const auto& observed : atoms)
+      evidence.atoms.emplace(observed, retire);
   }
-  return atoms;
+  return evidence;
 }
 
 struct case_result {
   int ordinal = -1;
   int index = 0;
-  std::set<atom> atoms;
+  std::map<atom, int> atoms;
+  std::map<instruction_pair, int> instruction_pairs;
   std::optional<std::string> error;
 };
 
@@ -1057,7 +1063,9 @@ case_result run_case(const test_case& tc, spike_runner& runner, int ordinal = -1
     const auto right_words = words_for(tc.registers2, tc.program2, tc.max_instruction_count);
     const auto left = runner.run_side(left_words, retire_count);
     const auto right = runner.run_side(right_words, retire_count);
-    result.atoms = extract_atoms(left, right);
+    auto evidence = extract_evidence(left, right);
+    result.atoms = std::move(evidence.atoms);
+    result.instruction_pairs = std::move(evidence.instruction_pairs);
   } catch (const std::exception& e) {
     result.error = e.what();
   }
@@ -1080,15 +1088,31 @@ std::string json_escape(const std::string& s)
   return out;
 }
 
-void write_atoms(std::ostream& out, const std::set<atom>& atoms)
+void write_atoms(std::ostream& out, const std::map<atom, int>& atoms)
 {
   out << "[";
   bool first = true;
-  for (const auto& a : atoms) {
+  for (const auto& [a, first_retire] : atoms) {
     if (!first) out << ",";
     first = false;
     out << "{\"type\":\"" << json_escape(a.type) << "\",\"observation\":\""
-        << json_escape(a.observation) << "\"}";
+        << json_escape(a.observation) << "\",\"first_retire\":"
+        << first_retire << "}";
+  }
+  out << "]";
+}
+
+void write_instruction_pairs(std::ostream& out,
+                             const std::map<instruction_pair, int>& instruction_pairs)
+{
+  out << "[";
+  bool first = true;
+  for (const auto& [pair, first_retire] : instruction_pairs) {
+    if (!first) out << ",";
+    first = false;
+    out << "{\"left\":\"" << json_escape(pair.left) << "\",\"right\":\""
+        << json_escape(pair.right) << "\",\"first_retire\":"
+        << first_retire << "}";
   }
   out << "]";
 }
@@ -1098,6 +1122,8 @@ void write_result(std::ostream& out, const case_result& result)
   out << "{\"ordinal\":" << result.ordinal
       << ",\"case_index\":" << result.index << ",\"atoms\":";
   write_atoms(out, result.atoms);
+  out << ",\"instruction_pairs\":";
+  write_instruction_pairs(out, result.instruction_pairs);
   if (result.error)
     out << ",\"error\":\"" << json_escape(*result.error) << "\"";
   out << "}";

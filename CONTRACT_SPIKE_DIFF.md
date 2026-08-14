@@ -1,236 +1,184 @@
-# Contract Spike Diff
+# Contract Spike Atom Replay
 
-This Spike clone adds atom distinguishability for contractgen testcase JSON. It now has both:
+This Spike checkout contains a bounded, paired RISC-V atom replay used by
+contractgen. It is available as:
 
-- a standalone CLI, `build/contract-spike-diff`
-- a shared library, `build/libcontract_spike_atom.so`, used from Java through `SpikeAtomClient`
+- `build/contract-spike-diff`, a standalone JSON command;
+- `build/libcontract_spike_atom.so`, the native library used by Java.
 
-Example standalone run:
+The replay consumes contractgen testcase JSON directly. It does not require an
+ELF, VCD, RVFI trace, or result JSON.
+
+## Build and invocation
 
 ```sh
+make -C build -j2 contract-spike-diff libcontract_spike_atom.so
+
 build/contract-spike-diff \
   --testcases ../1000-IBEX-testcases.json \
   --all \
   --json-out /tmp/spike-atoms.json
 ```
 
-It consumes contractgen testcase JSON directly. It does not consume ELF files and it does not consume `1000-IBEX-results.json`; that results file was only used externally as a validation oracle.
+The shared-library entry point is
+`contract_spike_atoms_json(testcases, isa, ordinal)`.
 
-## Files Changed
+## Program and execution model
 
-- `spike_main/contract-spike-diff.cc`
-  Implements the JSON parser, testcase instruction encoder, in-process Spike runner, atom extractor, CLI output, and C ABI used by the Java shared-library client.
+Each side contains:
 
-- `spike_main/spike_main.mk.in`
-  Adds `contract-spike-diff.cc` to the Spike main-program build list so `make contract-spike-diff libcontract_spike_atom.so` produces the binary and shared library.
+1. 31 register-initialization instructions;
+2. one NOP gap;
+3. the testcase program;
+4. NOP padding.
 
-- `src/main/java/contractgen/riscv/isa/spike/SpikeAtomClient.java`
-  Loads `libcontract_spike_atom.so` with JNA, passes testcase JSON directly, and parses Spike atom JSON back into `RISCVObservation` values.
+Replay requests `31 + maxInstructionCount` retirements. Spike stores and runs
+the synthetic image at `0x1000`. For compatibility with the Ibex instruction
+memory, absolute JALR targets in the harness image beginning at `0x80` are
+mapped to the corresponding private-image offset. PC-relative branch and JAL
+displacements are not remapped: relocating both the instruction and its target
+preserves their encoded displacement.
 
-- `src/main/java/contractgen/Main.java`
-  Adds/extends `compare_spike_rvfi_atoms`, which runs Spike atom extraction and the existing IBEX_TEST RVFI extractor side by side and emits one JSON comparison report.
+Spike follows architectural control flow without a core-specific fetch-budget
+heuristic. Taken transfers may enter the register-loader prologue, re-enter the
+testcase, or loop within it. Targets outside the finite replay image read as NOP.
+The core-specific end of useful execution is supplied separately by the RTL
+harness, keeping the Spike replay usable with Ibex, CVA6, and other cores.
 
-- `src/main/java/contractgen/riscv/isa/tests/RISCVTestCaseIO.java`
-  Adds testcase JSON serialization helpers so generated in-memory testcases can be passed to Spike without writing `.dat` instruction-memory files.
+Both sides continue along their own architectural paths after next-PC or
+branch-taken divergence. This is required to observe atoms in different
+following instructions. It also means dependency atoms in later instructions
+can reflect the distinct histories of the two paths.
 
-## Input And Output
+The replay implements the RV32I/RV32M instruction semantics used by generated
+testcases while using Spike as the native instruction-image host. Arbitrary
+architectural data addresses do not enter Spike's MMU.
 
-Input is a contractgen testcase JSON array. Each testcase must contain:
+## Memory model
 
-- `index`
-- `registers1`, `program1`
-- `registers2`, `program2`
-- `maxInstructionCount`
+Data memory is sparse, byte-addressed, and private to each side:
 
-The output is JSON. For `--case-index N`, the shape is:
+- untouched bytes read as zero;
+- stores update only bytes selected by the instruction width;
+- later loads observe stored bytes;
+- byte and halfword loads apply the architectural sign/zero extension;
+- the observed read/write bus values follow the Ibex RVFI byte-lane layout.
+
+This policy is deliberately not tied to random address-derived data. It is a
+portable deterministic harness model that can be implemented by Ibex, CVA6, or
+another core. The RTL memory used for comparison must use the same untouched
+byte and store semantics.
+
+## Atom output and retirement metadata
+
+For one case the output is:
 
 ```json
 {
   "case_index": 0,
   "atoms": [
-    {"type": "LUI", "observation": "RD"}
+    {
+      "type": "ADDI",
+      "observation": "OPCODE",
+      "first_retire": 34
+    }
+  ],
+  "instruction_pairs": [
+    {
+      "left": "JALR",
+      "right": "ADDI",
+      "first_retire": 36
+    }
   ]
 }
 ```
 
-For `--all`, the shape is:
+`first_retire` is the earliest absolute, one-based retirement at which that
+exact `(type, observation)` atom distinguishes the two executions. It includes
+the 31 initialization retirements. If an atom occurs repeatedly, only its
+earliest retirement is retained. When the two sides retire different
+instruction types, `instruction_pairs` similarly records the ordered type pair
+and its earliest retirement. The native response contains compact evidence
+metadata only, never a full instruction trace.
 
-```json
-{
-  "cases": [...],
-  "summary": {"total": 1000, "failed": 0}
-}
-```
+Java preserves the ordinary atom-set API for callers that do not need timing.
+During replay synthesis it uses `first_retire` internally:
 
-A nonzero exit status means at least one testcase had an execution/extraction error.
-Successful atom mismatches against an external oracle are not checked by Spike itself.
+- attacker-positive executed case: keep atoms and instruction pairs whose
+  `first_retire <= cutoff`;
+- attacker-negative executed case: discard structural/control evidence and
+  instruction pairs after the RTL's last non-NOP retirement, while retaining
+  the possible four-retirement ADDI dependency tail;
+- adaptively skipped evidence: retain the existing signature-level behavior,
+  because no per-case RTL cutoff exists.
 
-## Main Implementation Choices
+An attacker-positive result without a cutoff, or with no evidence remaining
+after filtering, is an error. Final result JSON and synthesized-contract
+formats do not expose `first_retire`; they retain the existing
+`distinguishingInstructions` representation for instruction pairs.
 
-The tool runs Spike in-process instead of launching `spike` on an ELF. It constructs two synthetic RV32 programs from each testcase:
+## Atom semantics
 
-1. 31 register-initialization instructions, matching contractgen's init layout.
-2. One NOP gap, matching the existing feasibility prototype layout.
-3. The testcase program instructions.
-4. NOP padding.
+The replay supports the current contractgen observation groups:
 
-The extractor compares retired samples after the 31 init instructions, so the synthetic initialization code is not reported as atom-distinguishing behavior.
+- structural: `FORMAT`, `OPCODE`, `FUNCT3`, `FUNCT7`, `RD`, `RS1`, `RS2`,
+  `IMM`;
+- values: `REG_RS1`, `REG_RS2`, `REG_RD`, `MEM_ADDR`, `MEM_R_DATA`,
+  `MEM_W_DATA`, their `ZERO`/`LOG2` register variants, and alignment atoms;
+- control: `IS_BRANCH`, `BRANCH_TAKEN`, `NEW_PC`;
+- dependencies: `RAW_RS1_1..4`, `RAW_RS2_1..4`, and `WAW_1..4`.
 
-The tool encodes the symbolic contractgen instructions itself. The supported instruction set currently covers the RV32 base integer instructions used by the testcase file plus RV32M arithmetic operations.
+Dependency distance is measured in dynamic retirements on each side. At
+distance `d`, RAW compares the current source register with the destination
+retired `d` steps earlier, and WAW compares current and prior destinations.
+Consequently, a control-flow divergence can legitimately create later
+dependency distinctions even if both paths eventually execute NOPs.
 
-Spike is configured with:
+ZERO observations identify zero versus nonzero. LOG2 observations compare
+`floor(log2(unsigned_value))`, with zero in a separate sentinel bucket.
+`IS_ALIGNED` means `address[1:0] == 0`; `IS_HALF_ALIGNED` means
+`address[1:0] != 3`, matching the current Ibex extractor.
 
-- ISA default: `RV32IM_Zicclsm`
-- privilege mode: `M`
-- memory mapped at `0x1000`
-- PC start at `0x1000`
-- HTIF argument `none`, so Spike does not require an ELF payload
+JAL and JALR are always taken control instructions. Conditional branch
+taken-ness is evaluated from each side's sampled source values, and `NEW_PC`
+uses the architectural target address.
 
-Spike memory remains mapped at `0x1000`, but the IBEX harness fetches from an instruction-memory view based at `0x80`. After each step, branch/jump targets in the harness range are translated from `0x80 + offset` to `0x1000 + offset`. This is a compatibility shim for the current IBEX_TEST harness, not a general RISC-V platform model.
+### Shift-immediate caveat
 
-The Java command can either consume an existing testcase file:
+Contractgen currently represents `SLLI`, `SRLI`, and `SRAI` with an R-type
+encoding shortcut: the shift amount is stored in the Java `rs2` field. Replay
+uses that field to encode instruction bits `[24:20]`, but it does not read
+`x[shamt]` or emit runtime `REG_RS2`/`RAW_RS2` behavior for it. Architecturally
+the operand is an immediate, not a source register. A future Java ISA cleanup
+should model it as `shamt`/`IMM` and regenerate oracle artifacts.
+
+## Comparison workflow
+
+For a focused oracle comparison:
 
 ```sh
 mvn -q exec:java -Dexec.mainClass=contractgen.Main \
-  -Dexec.args='compare_spike_rvfi_atoms -i BASE,M -c BASE,ALIGNED,BRANCH,DEPENDENCIES -t 4 -e 12000-IBEX-testcases.json -o spike-rvfi-compare.json'
+  -Dexec.args='compare_spike_rvfi_atoms -i BASE,M -c BASE,ALIGNED,BRANCH,DEPENDENCIES -t 4 -e 1000-IBEX-testcases.json -o spike-rvfi-compare.json'
 ```
 
-or generate tests when `-e/--testcases` is omitted:
+For synthesis replay, Spike runs once and Java performs cutoff filtering. The
+IBEX_TEST attacker is invoked once per executed testcase, but an attacker-
+positive invocation internally reruns fresh native models with decreasing fetch
+bounds to reproduce the old Ibex/RVFI prefix minimization. Its cutoff is the
+final paired retirement count of the smallest failing run; no VCD is written or
+parsed. Add `--disable-adaptive-skipping` to execute the RTL attacker for every
+testcase.
 
-```sh
-mvn -q exec:java -Dexec.mainClass=contractgen.Main \
-  -Dexec.args='compare_spike_rvfi_atoms -i BASE,M -c BASE,ALIGNED,BRANCH,DEPENDENCIES -t 4 -n 1000 -s 1 -o spike-rvfi-compare.json'
-```
+After changing the native replay or Ibex harness, rebuild both native
+libraries before comparing results. No Dockerfile or Docker-image change is
+required solely for these source changes.
 
-Generated or loaded testcases are sent to Spike in fixed internal chunks of 1000 cases. This is intentionally not a CLI option.
+## Files
 
-## Assumptions
-
-This implementation is intentionally calibrated to the current contractgen/IBEX testcase workflow.
-
-- Testcases are RV32.
-- Register initialization follows contractgen's `ADDI xN, x0, imm` behavior, including 12-bit signed immediate effects.
-- Root oracle files stay outside the Spike clone.
-- The tool reports the `BASE,ALIGNED,BRANCH,DEPENDENCIES,VALUE` atom groups:
-  `FORMAT`, `OPCODE`, `FUNCT3`, `FUNCT7`, `RD`, `RS1`, `RS2`, `IMM`,
-  `REG_RS1`, `REG_RS2`, `REG_RD`, `MEM_ADDR`, `MEM_R_DATA`, `MEM_W_DATA`,
-  `IS_ALIGNED`, `IS_HALF_ALIGNED`, `IS_BRANCH`, `BRANCH_TAKEN`, `NEW_PC`,
-  `RAW_RS1_1` through `RAW_RS1_4`, `RAW_RS2_1` through `RAW_RS2_4`, and
-  `WAW_1` through `WAW_4`, plus `REG_RS1_ZERO`, `REG_RS2_ZERO`,
-  `REG_RD_ZERO`, `REG_RS1_LOG2`, `REG_RS2_LOG2`, and `REG_RD_LOG2`.
-- ZERO atoms distinguish zero from nonzero and are attributed to the instruction
-  side whose value is zero, matching the Java RVFI extractors. LOG2 atoms compare
-  `floor(log2(value))` over unsigned RV32 values; zero occupies its own sentinel
-  bucket. If only one side has the relevant operand, its instruction receives both
-  corresponding VALUE atoms, again matching the Java extractor behavior.
-- Branch target execution follows the harness-style finite instruction image: out-of-image instruction fetches are modeled as NOPs.
-- If a control-flow observation diverges through taken-ness or next-PC, comparison stops after the control sample. This matches most observed IBEX_TEST oracle behavior and avoids treating later synthetic NOP padding as the primary atom source.
-- Loads and stores are modeled for atom observation compatibility with the IBEX harness, not as general Spike memory semantics. The custom IBEX `data_mem.sv` returns address-derived read data (`addr % 0x1000`) and exposes byte-enable-masked RVFI memory data; the tool mirrors that convention.
-- The synthetic memory values do not replace Spike's actual load/store step. If that step traps because an address is outside Spike's mapped memory, the Spike trace ends while the IBEX harness may continue. Random instruction suffixes amplify this difference: RVFI can report propagated register and memory atoms from the remaining suffix that Spike never samples.
-- Writes to `x0` expose `REG_RD == 0` in the Spike compatibility model. This matches the current oracle better than reporting the computed writeback value for `rd == 0`: changing Spike to report computed `x0` writeback values increased the saved 12k BASE mismatch count from 8 to 101, mostly extra `ADDI/REG_RD`.
-- `IS_ALIGNED` is computed as `mem_addr[1:0] == 0`; `IS_HALF_ALIGNED` is computed as `mem_addr[1:0] != 3`, matching the Ibex `ctr.sv` helper signals.
-- Branch observations are computed like the Ibex `ctr.sv` helper signals: JAL and JALR are control instructions and are always branch-taken; conditional branch taken-ness is recomputed from the sampled source-register values.
-- Dependency atoms use a four-retirement window, matching `RVFIExtractor.compareDependencies`: `RAW_RS1_d` and `RAW_RS2_d` compare the current source register against the destination register `d` retirements earlier; `WAW_d` compares the current destination against the earlier destination.
-
-## Shift-Immediate Operand Caveat
-
-`SLLI`, `SRLI`, and `SRAI` are architecturally shift-immediate instructions:
-
-```text
-SLLI rd, rs1, shamt
-SRLI rd, rs1, shamt
-SRAI rd, rs1, shamt
-```
-
-The last operand is `shamt`, not `rs2`. It is encoded in instruction bits `[24:20]`, the same bit position used by `rs2` in R-type instructions, but it is an immediate field and does not name a source register.
-
-The current Java contractgen ISA model represents these three instructions as `RISCV_FORMAT.RTYPE` and stores `shamt` in the `rs2` field. That is a convenient encoding shortcut because R-type encoding already has `funct7 | rs2 | rs1 | funct3 | rd | opcode`, which matches the shift-immediate bit layout as `funct7 | shamt | rs1 | funct3 | rd | opcode`. Semantically, however, this pollutes the contract atom model:
-
-- `SLLI/RS2`, `SRLI/RS2`, and `SRAI/RS2` should not be valid ISA-level atoms.
-- `SLLI/REG_RS2`, `SRLI/REG_RS2`, and `SRAI/REG_RS2` should not be valid runtime register-value atoms.
-- `RAW_RS2_*` dependency atoms should not apply to these instructions.
-- A differing shift amount should be reported as `IMM`, or as a future dedicated `SHAMT` atom if the contract vocabulary is made more precise.
-
-This explains why generated IBEX result files can contain atoms such as:
-
-```json
-{ "type": "SLLI", "observation": "REG_RS2" }
-```
-
-in `ALL_ATOMS`. In the checked `1000-IBEX-results.json` and `10000-IBEX-results.json` files, this atom appears in the atom universe, not as an actual per-test observation. It is admitted because `RISCVObservation.isApplicable()` delegates to `RISCVInstruction.hasRS2(type)`, and `hasRS2(SLLI)` currently returns true due to the R-type shortcut.
-
-For this temporary IBEX_TEST oracle-compatibility mode, Spike currently follows the Java encoding shortcut for structural shift-immediate bits but suppresses runtime `REG_RS2` reads for shift-immediate instructions:
-
-- `SLLI/SRLI/SRAI` are encoded from the testcase `rs2` field because that is where current contractgen stores `shamt`.
-- Spike does not read or compare `x[shamt]` as a runtime `REG_RS2` value.
-- The long-term architectural cleanup should move these instructions to `rd`, `rs1`, and `imm/shamt` in Java and regenerate the oracle files.
-
-Until contractgen's Java ISA model is corrected and oracle files are regenerated, exact oracle comparisons involving these shift-immediate `RS2` atoms should be interpreted as oracle/model mismatches, not necessarily Spike implementation bugs.
-
-## Validation
-
-The original base-template validation command was:
-
-```sh
-build/contract-spike-diff \
-  --testcases ../1000-IBEX-testcases.json \
-  --all \
-  --json-out /tmp/spike-atoms.json
-```
-
-The generated `/tmp/spike-atoms.json` was compared externally against `../1000-IBEX-results.json`.
-
-Result:
-
-```text
-summary {'total': 1000, 'failed': 0}
-mismatches 0
-```
-
-Earlier full-template validation against `12000-IBEX-results.json` showed larger dependency and shift-immediate differences. After adding the Java shared-library command, the current local reference is the saved BASE-only comparison file `spike-rvfi-compare.json` and the 12k testcase file:
-
-```sh
-build/contract-spike-diff \
-  --testcases ../12000-IBEX-testcases.json \
-  --all \
-  --json-out /tmp/spike-atoms-12000-fixed.json
-```
-
-Result:
-
-```text
-spike summary: total 12000, failed 0
-BASE-only mismatches against saved spike-rvfi-compare.json: 8 / 12000
-```
-
-The remaining BASE mismatch classes in that saved 12k run are:
-
-```text
-5 cases where RVFI reports ADDI padding/NOP atoms after control-flow behavior and Spike does not.
-3 cases where Spike reports LH/LHU MEM_R_DATA and REG_RD differences for unaligned halfword loads and RVFI does not.
-```
-
-The load mismatches are not safely fixed by a simple aligned-default-memory rule: that removes the 3 overreports but introduces 5 new `LH/LHU REG_RD` underreports in the same saved 12k file. For now they are documented as an IBEX_TEST RVFI oracle compatibility gap, not hidden by a heuristic.
-
-The full Java command could not be end-to-end rerun in this local workspace because `IBEXTest` tries to create simulation output under the hardcoded `/home/yosys/output/...` path. The Java code was compile-checked with `javac`; the native Spike CLI/shared library was rebuilt successfully.
-
-## Build Notes
-
-This upstream Spike checkout required `dtc` during configure/build. In this workspace, the working build command was:
-
-```sh
-make -C build -j2 contract-spike-diff libcontract_spike_atom.so
-```
-
-The built artifacts are:
-
-```text
-build/contract-spike-diff
-build/libcontract_spike_atom.so
-```
-
-## Limitations
-
-This is now a shared-library integration for comparison, but not yet the main synthesis path. The existing RVFI extractor still exists and `compare_spike_rvfi_atoms` deliberately reports both Spike atoms and old RVFI atoms.
-
-The memory and branch edge behavior is currently matched to the IBEX harness oracle. If the next target is a processor-independent ISA-level atom oracle, those conventions should be separated behind a selectable compatibility mode.
+- `spike_main/contract-spike-diff.cc`: JSON parsing, instruction encoding,
+  bounded execution, atom extraction, CLI, and C ABI.
+- `spike_main/spike_main.mk.in`: native binary/shared-library build targets.
+- `../src/main/java/contractgen/riscv/isa/spike/SpikeAtomClient.java`: JNA
+  client and timed-atom parsing.
+- `../src/main/java/contractgen/riscv/isa/spike/SpikeAtomParallelRunner.java`:
+  chunked, process-isolated replay.
