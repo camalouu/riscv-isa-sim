@@ -997,6 +997,8 @@ extracted_evidence extract_evidence(const std::vector<sample>& left, const std::
                  left[idx].reg_rs2, right[idx].reg_rs2);
     compare_log2(atoms, i1, i2, "REG_RS2_LOG2", has_rs2_1, has_rs2_2,
                  left[idx].reg_rs2, right[idx].reg_rs2);
+    compare_value(atoms, i1, i2, "REG_RS2_LOW5", has_rs2_1, has_rs2_2,
+                  left[idx].reg_rs2 & 0x1fu, right[idx].reg_rs2 & 0x1fu);
     compare_value(atoms, i1, i2, "REG_RD", has_rd_1, has_rd_2,
                   left[idx].reg_rd, right[idx].reg_rd);
     compare_zero(atoms, i1, i2, "REG_RD_ZERO", has_rd_1, has_rd_2,

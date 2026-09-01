@@ -124,7 +124,8 @@ The replay supports the current contractgen observation groups:
 - structural: `FORMAT`, `OPCODE`, `FUNCT3`, `FUNCT7`, `RD`, `RS1`, `RS2`,
   `IMM`;
 - values: `REG_RS1`, `REG_RS2`, `REG_RD`, `MEM_ADDR`, `MEM_R_DATA`,
-  `MEM_W_DATA`, their `ZERO`/`LOG2` register variants, and alignment atoms;
+  `MEM_W_DATA`, their `ZERO`/`LOG2` register variants, `REG_RS2_LOW5`, and
+  alignment atoms;
 - control: `IS_BRANCH`, `BRANCH_TAKEN`, `NEW_PC`;
 - dependencies: `RAW_RS1_1..4`, `RAW_RS2_1..4`, and `WAW_1..4`.
 
@@ -136,6 +137,8 @@ dependency distinctions even if both paths eventually execute NOPs.
 
 ZERO observations identify zero versus nonzero. LOG2 observations compare
 `floor(log2(unsigned_value))`, with zero in a separate sentinel bucket.
+`REG_RS2_LOW5` compares `rs2_value[4:0]`, modeling operand-dependent register
+shift latency without exposing the rest of the source value.
 `IS_ALIGNED` means `address[1:0] == 0`; `IS_HALF_ALIGNED` means
 `address[1:0] != 3`, matching the current Ibex extractor.
 
