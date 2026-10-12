@@ -9,7 +9,9 @@
 #include "trap.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
+#include <cmath>
 #include <cstring>
 #include <cstdint>
 #include <cstdlib>
@@ -28,12 +30,15 @@
 
 namespace {
 
-constexpr reg_t TEXT_BASE = 0x1000;
 constexpr reg_t HARNESS_TEXT_BASE = 0x80;
-constexpr size_t MEM_SIZE = 16 * 1024 * 1024;
 constexpr int INIT_COUNT = 31;
 constexpr uint32_t NOP = 0x00000013;
-constexpr size_t DATA_MEM_HISTORY = 32;
+constexpr size_t IMAGE_WORDS = 2048;
+enum class execution_model { rv32_v1 };
+execution_model parse_execution_model(const std::string& name) {
+  if (name == "rv32-v1") return execution_model::rv32_v1;
+  throw std::runtime_error("Only rv32-v1 is supported; historical execution requires the archived environment: " + name);
+}
 
 struct json_value {
   using object_t = std::map<std::string, json_value>;
@@ -43,7 +48,14 @@ struct json_value {
   const object_t& object() const { return std::get<object_t>(value); }
   const array_t& array() const { return std::get<array_t>(value); }
   const std::string& string() const { return std::get<std::string>(value); }
-  int64_t integer() const { return static_cast<int64_t>(std::get<double>(value)); }
+  int64_t integer() const {
+    const double number = std::get<double>(value);
+    if (!std::isfinite(number) || std::trunc(number) != number ||
+        number < double(std::numeric_limits<int64_t>::min()) ||
+        number >= -double(std::numeric_limits<int64_t>::min()))
+      throw std::runtime_error("Invalid JSON integer");
+    return static_cast<int64_t>(number);
+  }
   bool is_null() const { return std::holds_alternative<std::nullptr_t>(value); }
 };
 
@@ -97,7 +109,8 @@ private:
       std::string key = parse_string();
       skip_ws();
       expect(':');
-      out.emplace(std::move(key), parse_value());
+      if (!out.emplace(std::move(key), parse_value()).second)
+        throw std::runtime_error("Duplicate JSON object key");
       skip_ws();
       if (consume('}')) return out;
       expect(',');
@@ -303,6 +316,20 @@ const json_value* find_field(const json_value::object_t& obj, const std::string&
   return it == obj.end() ? nullptr : &it->second;
 }
 
+const json_value& required_field(const json_value::object_t& obj, const std::string& key)
+{
+  const auto* field = find_field(obj, key);
+  if (!field) throw std::runtime_error("Missing testcase field: " + key);
+  return *field;
+}
+
+int checked_int(int64_t value)
+{
+  if (value < std::numeric_limits<int>::min() || value > std::numeric_limits<int>::max())
+    throw std::runtime_error("Testcase integer outside 32-bit range");
+  return static_cast<int>(value);
+}
+
 int64_t int_field(const json_value::object_t& obj, const std::string& key, int64_t fallback = 0)
 {
   const auto* field = find_field(obj, key);
@@ -313,7 +340,7 @@ std::optional<int> opt_int_field(const json_value::object_t& obj, const std::str
 {
   const auto* field = find_field(obj, key);
   if (!field || field->is_null()) return std::nullopt;
-  return static_cast<int>(field->integer());
+  return checked_int(field->integer());
 }
 
 std::optional<int64_t> opt_i64_field(const json_value::object_t& obj, const std::string& key)
@@ -327,7 +354,10 @@ std::map<int, std::optional<int64_t>> parse_registers(const json_value& value)
 {
   std::map<int, std::optional<int64_t>> out;
   for (const auto& entry : value.object()) {
-    int reg = std::stoi(entry.first);
+    size_t consumed;
+    int reg = std::stoi(entry.first, &consumed);
+    if (consumed != entry.first.size() || reg < 0 || reg > 31)
+      throw std::runtime_error("Invalid register initialization index");
     if (entry.second.is_null())
       out[reg] = std::nullopt;
     else
@@ -342,7 +372,7 @@ std::vector<program_insn> parse_program(const json_value& value)
   for (const auto& raw : value.array()) {
     const auto& obj = raw.object();
     program_insn insn;
-    insn.type = find_field(obj, "type")->string();
+    insn.type = required_field(obj, "type").string();
     insn.rd = opt_int_field(obj, "rd");
     insn.rs1 = opt_int_field(obj, "rs1");
     insn.rs2 = opt_int_field(obj, "rs2");
@@ -360,12 +390,12 @@ std::vector<test_case> parse_testcases_json(const std::string& json)
   for (const auto& raw : root.array()) {
     const auto& obj = raw.object();
     test_case tc;
-    tc.index = static_cast<int>(int_field(obj, "index"));
-    tc.max_instruction_count = static_cast<int>(int_field(obj, "maxInstructionCount"));
-    tc.registers1 = parse_registers(*find_field(obj, "registers1"));
-    tc.registers2 = parse_registers(*find_field(obj, "registers2"));
-    tc.program1 = parse_program(*find_field(obj, "program1"));
-    tc.program2 = parse_program(*find_field(obj, "program2"));
+    tc.index = checked_int(int_field(obj, "index"));
+    tc.max_instruction_count = checked_int(int_field(obj, "maxInstructionCount"));
+    tc.registers1 = parse_registers(required_field(obj, "registers1"));
+    tc.registers2 = parse_registers(required_field(obj, "registers2"));
+    tc.program1 = parse_program(required_field(obj, "program1"));
+    tc.program2 = parse_program(required_field(obj, "program2"));
     out.push_back(std::move(tc));
   }
   return out;
@@ -439,8 +469,10 @@ uint32_t encode_addi(int rd, int rs1, int64_t imm)
 
 std::vector<uint32_t> words_for(const std::map<int, std::optional<int64_t>>& regs,
                                 const std::vector<program_insn>& program,
-                                int max_instruction_count)
+                                int max_instruction_count, execution_model model = execution_model::rv32_v1)
 {
+  if ((max_instruction_count < 0 || program.size() > IMAGE_WORDS - 32))
+    throw std::runtime_error("Invalid rv32-v1 program image bounds");
   std::vector<uint32_t> words;
   for (int reg = 1; reg < 32; reg++) {
     auto it = regs.find(reg);
@@ -452,7 +484,7 @@ std::vector<uint32_t> words_for(const std::map<int, std::optional<int64_t>>& reg
   words.push_back(NOP);
   for (const auto& insn : program)
     words.push_back(encode(insn));
-  while (static_cast<int>(words.size()) < INIT_COUNT + 1 + max_instruction_count + 16)
+  while (static_cast<int>(words.size()) < int(IMAGE_WORDS))
     words.push_back(NOP);
   return words;
 }
@@ -558,133 +590,6 @@ uint32_t sext(uint32_t value, unsigned bits)
   return (value ^ mask) - mask;
 }
 
-std::optional<uint32_t> semantic_rd_value(const decoded_insn& insn, reg_t pc,
-                                          uint32_t rs1, uint32_t rs2)
-{
-  const uint32_t imm12 = insn.imm ? sext(*insn.imm, 12) : 0;
-  const uint32_t shamt = insn.imm.value_or(insn.rs2.value_or(0)) & 0x1f;
-  if (insn.type == "LUI") return insn.imm.value_or(0);
-  if (insn.type == "AUIPC") return static_cast<uint32_t>(pc) + insn.imm.value_or(0);
-  if (insn.type == "JAL" || insn.type == "JALR") return static_cast<uint32_t>(pc + 4);
-  if (insn.type == "ADDI") return rs1 + imm12;
-  if (insn.type == "SLTI") return static_cast<int32_t>(rs1) < static_cast<int32_t>(imm12);
-  if (insn.type == "SLTIU") return rs1 < imm12;
-  if (insn.type == "XORI") return rs1 ^ imm12;
-  if (insn.type == "ORI") return rs1 | imm12;
-  if (insn.type == "ANDI") return rs1 & imm12;
-  if (insn.type == "SLLI") return rs1 << shamt;
-  if (insn.type == "SRLI") return rs1 >> shamt;
-  if (insn.type == "SRAI") return static_cast<uint32_t>(static_cast<int32_t>(rs1) >> shamt);
-  if (insn.type == "ADD") return rs1 + rs2;
-  if (insn.type == "SUB") return rs1 - rs2;
-  if (insn.type == "SLL") return rs1 << (rs2 & 0x1f);
-  if (insn.type == "SLT") return static_cast<int32_t>(rs1) < static_cast<int32_t>(rs2);
-  if (insn.type == "SLTU") return rs1 < rs2;
-  if (insn.type == "XOR") return rs1 ^ rs2;
-  if (insn.type == "SRL") return rs1 >> (rs2 & 0x1f);
-  if (insn.type == "SRA") return static_cast<uint32_t>(static_cast<int32_t>(rs1) >> (rs2 & 0x1f));
-  if (insn.type == "OR") return rs1 | rs2;
-  if (insn.type == "AND") return rs1 & rs2;
-  if (insn.type == "MUL") return rs1 * rs2;
-  if (insn.type == "MULH") {
-    const int64_t r = static_cast<int64_t>(static_cast<int32_t>(rs1)) *
-                      static_cast<int64_t>(static_cast<int32_t>(rs2));
-    return static_cast<uint32_t>(static_cast<uint64_t>(r) >> 32);
-  }
-  if (insn.type == "MULHSU") {
-    const int64_t r = static_cast<int64_t>(static_cast<int32_t>(rs1)) *
-                      static_cast<uint64_t>(rs2);
-    return static_cast<uint32_t>(static_cast<uint64_t>(r) >> 32);
-  }
-  if (insn.type == "MULHU") {
-    const uint64_t r = static_cast<uint64_t>(rs1) * static_cast<uint64_t>(rs2);
-    return static_cast<uint32_t>(r >> 32);
-  }
-  if (insn.type == "DIV") {
-    if (rs2 == 0) return UINT32_MAX;
-    if (rs1 == 0x80000000u && rs2 == UINT32_MAX) return rs1;
-    return static_cast<uint32_t>(static_cast<int32_t>(rs1) / static_cast<int32_t>(rs2));
-  }
-  if (insn.type == "DIVU") return rs2 == 0 ? UINT32_MAX : rs1 / rs2;
-  if (insn.type == "REM") {
-    if (rs2 == 0) return rs1;
-    if (rs1 == 0x80000000u && rs2 == UINT32_MAX) return 0;
-    return static_cast<uint32_t>(static_cast<int32_t>(rs1) % static_cast<int32_t>(rs2));
-  }
-  if (insn.type == "REMU") return rs2 == 0 ? rs1 : rs1 % rs2;
-  return std::nullopt;
-}
-
-uint32_t byte_mask_for(const decoded_insn& insn, uint32_t addr)
-{
-  const unsigned offset = addr & 0x3u;
-  unsigned bytes = 0;
-  if (insn.type == "LB" || insn.type == "LBU" || insn.type == "SB")
-    bytes = 1;
-  else if (insn.type == "LH" || insn.type == "LHU" || insn.type == "SH")
-    bytes = 2;
-  else if (insn.type == "LW" || insn.type == "SW")
-    bytes = 4;
-  uint32_t mask = 0;
-  for (unsigned i = 0; i < bytes && offset + i < 4; i++)
-    mask |= 1u << (offset + i);
-  return mask;
-}
-
-uint32_t apply_byte_enable_mask(uint32_t value, uint32_t byte_mask)
-{
-  uint32_t out = 0;
-  for (unsigned i = 0; i < 4; i++) {
-    if (byte_mask & (1u << i))
-      out |= value & (0xffu << (i * 8));
-  }
-  return out;
-}
-
-struct data_mem_model {
-  std::vector<std::pair<uint32_t, uint8_t>> history;
-
-  data_mem_model() : history(DATA_MEM_HISTORY, {0, 0}) {}
-
-  uint32_t load_bus_value(const decoded_insn& insn, uint32_t addr) const
-  {
-    uint32_t value = 0;
-    const uint32_t byte_mask = byte_mask_for(insn, addr);
-    for (const auto& [stored_addr, stored_value] : history) {
-      for (unsigned lane = 0; lane < 4; lane++) {
-        if ((byte_mask & (1u << lane)) && addr + lane == stored_addr) {
-          value &= ~(0xffu << (lane * 8));
-          value |= static_cast<uint32_t>(stored_value) << (lane * 8);
-        }
-      }
-    }
-    return apply_byte_enable_mask(value, byte_mask);
-  }
-
-  void store(const decoded_insn& insn, uint32_t addr, uint32_t value)
-  {
-    const uint32_t byte_mask = byte_mask_for(insn, addr);
-    const unsigned offset = addr & 0x3u;
-    for (unsigned lane = 0; lane < 4; lane++) {
-      if (!(byte_mask & (1u << lane))) continue;
-      const unsigned source_lane = lane >= offset ? lane - offset : lane;
-      const uint8_t byte = static_cast<uint8_t>((value >> (source_lane * 8)) & 0xffu);
-      history.erase(history.begin());
-      history.push_back({addr + lane, byte});
-    }
-  }
-};
-
-uint32_t synthetic_load_rd_value(const decoded_insn& insn, uint32_t bus_value, uint32_t addr)
-{
-  const unsigned offset = addr & 0x3u;
-  if (insn.type == "LB") return sext((bus_value >> (offset * 8)) & 0xffu, 8);
-  if (insn.type == "LBU") return (bus_value >> (offset * 8)) & 0xffu;
-  if (insn.type == "LH") return sext(bus_value & 0xffffu, 16);
-  if (insn.type == "LHU") return bus_value & 0xffffu;
-  return bus_value;
-}
-
 bool branch_taken(const decoded_insn& insn, uint32_t rs1, uint32_t rs2)
 {
   if (insn.type == "JAL" || insn.type == "JALR") return true;
@@ -710,137 +615,115 @@ struct sample {
   uint64_t mem_w_data = 0;
 };
 
-void store_words(mem_t* mem, const std::vector<uint32_t>& words)
-{
-  for (size_t i = 0; i < words.size(); i++) {
-    const uint32_t word = words[i];
-    uint8_t bytes[4] = {
-      static_cast<uint8_t>(word & 0xff),
-      static_cast<uint8_t>((word >> 8) & 0xff),
-      static_cast<uint8_t>((word >> 16) & 0xff),
-      static_cast<uint8_t>((word >> 24) & 0xff),
-    };
-    if (!mem->store(i * 4, sizeof(bytes), bytes))
-      throw std::runtime_error("Could not load program into Spike memory");
-  }
-}
-
-struct spike_runner {
-  std::string isa_str;
+// Architectural environment shared by every conforming harness. Instruction
+// fetch is separate from data; all instructions execute Spike's own handlers.
+// No processor identity, timing, cache state, or RTL cutoffs enter this model.
+struct architectural_environment : simif_t {
   cfg_t cfg;
-  std::vector<device_factory_sargs_t> plugin_devices;
-  std::vector<std::string> htif_args{"none"};
-  debug_module_config_t dm_config;
-  mem_t* mem;
-  std::unique_ptr<sim_t> sim;
+  using page = std::array<char, 4096>;
+  std::map<uint32_t, page> data_pages, instruction_pages;
+  const std::vector<uint32_t>* image = nullptr;
+  bool fetching = false;
+  bool requires_misaligned_data_access = false;
+  std::map<size_t, processor_t*> harts;
+  std::unique_ptr<processor_t> proc;
 
-  spike_runner(const std::string& isa) : isa_str(isa) {
-    cfg.isa = isa_str.c_str();
-    cfg.priv = "M";
-    cfg.mem_layout = {mem_cfg_t(TEXT_BASE, MEM_SIZE)};
-    cfg.start_pc.set_global(TEXT_BASE);
-    
-    mem = new mem_t(MEM_SIZE);
-    std::vector<std::pair<reg_t, abstract_mem_t*>> mems = {{TEXT_BASE, mem}};
-    
-    sim = std::make_unique<sim_t>(&cfg, false, mems, plugin_devices, false, htif_args, dm_config,
-            "/dev/null", false, nullptr, false, nullptr, std::nullopt);
-    sim->get_core(0)->enable_log_commits();
+  explicit architectural_environment(std::string isa) {
+    std::transform(isa.begin(), isa.end(), isa.begin(), [](unsigned char c) { return std::toupper(c); });
+    if (isa != "RV32I" && isa != "RV32IM" && isa != "RV32I_ZICCLSM" && isa != "RV32IM_ZICCLSM")
+      throw std::runtime_error("rv32-v1 supports RV32I or RV32IM only");
+    // The shared byte-addressed environment supports misaligned scalar memory
+    // accesses through Spike's MMU, independently of any RTL core's capabilities.
+    if (isa == "RV32I" || isa == "RV32IM") isa += "_ZICCLSM";
+    cfg.pmpregions = 0;
+    proc = std::make_unique<processor_t>(isa.c_str(), "M", &cfg, this, 0, false, nullptr, std::cerr);
+    harts[0] = proc.get();
   }
-
-  std::vector<sample> run_side(const std::vector<uint32_t>& words, int retire_count) {
-    store_words(mem, words);
-    processor_t* proc = sim->get_core(0);
-    
-    proc->reset();
-    state_t* state = proc->get_state();
-    for (int i = 0; i < 32; i++) {
-        state->XPR.write(i, 0);
+  char* addr_to_mem(reg_t address) override {
+    const uint32_t addr = uint32_t(address);
+    const uint32_t base = addr & ~4095u;
+    auto& pages = fetching ? instruction_pages : data_pages;
+    auto [it, inserted] = pages.try_emplace(base, page{});
+    if (fetching && inserted) {
+      for (unsigned offset = 0; offset < 4096; ++offset) {
+        const uint32_t key = base + offset;
+        const uint32_t word = image && key >= HARNESS_TEXT_BASE && key < HARNESS_TEXT_BASE + IMAGE_WORDS * 4
+            ? (*image)[(key - HARNESS_TEXT_BASE) / 4] : NOP;
+        it->second[offset] = char(word >> (8 * (key & 3)));
+      }
     }
-    state->log_reg_write.clear();
-    state->log_mem_read.clear();
-    state->log_mem_write.clear();
-    state->pc = TEXT_BASE;
+    return it->second.data() + (addr & 4095);
+  }
+  bool mmio_load(reg_t, size_t, uint8_t*) override { return false; }
+  bool mmio_store(reg_t, size_t, const uint8_t*) override { return false; }
+  void proc_reset(unsigned) override {}
+  const cfg_t& get_cfg() const override { return cfg; }
+  const std::map<size_t, processor_t*>& get_harts() const override { return harts; }
+  const char* get_symbol(uint64_t) override { return nullptr; }
 
-    data_mem_model data_mem;
+  std::vector<sample> run(const std::vector<uint32_t>& words, int count) {
+    if (words.size() != IMAGE_WORDS || count < INIT_COUNT)
+      throw std::runtime_error("rv32-v1 requires 2048 image words and at least 31 retirements");
+    image = &words;
+    requires_misaligned_data_access = false;
+    proc->get_mmu()->flush_tlb();
+    data_pages.clear();
+    instruction_pages.clear();
+    proc->reset();
+    auto* state = proc->get_state();
+    for (int i = 0; i < 32; ++i) state->XPR.write(i, 0);
+    state->pc = HARNESS_TEXT_BASE;
     std::vector<sample> out;
-    out.reserve(retire_count);
-    for (int retired = 1; retired <= retire_count; retired++) {
-      const reg_t pc = state->pc;
-      uint32_t instr = NOP;
-      bool synthetic_nop = pc < TEXT_BASE || pc >= TEXT_BASE + words.size() * 4;
-      if (!synthetic_nop) {
-        try {
-          instr = static_cast<uint32_t>(proc->get_mmu()->load_insn(pc).insn.bits());
-        } catch (trap_t&) {
-          synthetic_nop = true;
-        } catch (trap_debug_mode&) {
-          synthetic_nop = true;
+    for (int retired = 0; retired < count; ++retired) {
+      const uint32_t pc = uint32_t(state->pc);
+      if (pc & 3) throw std::runtime_error("Misaligned rv32-v1 instruction address");
+      const uint32_t bits = pc >= HARNESS_TEXT_BASE && pc < HARNESS_TEXT_BASE + IMAGE_WORDS * 4
+          ? words[(pc - HARNESS_TEXT_BASE) / 4] : NOP;
+      const auto decoded = decode(bits); // Limit execution to the contract vocabulary.
+      sample s;
+      s.retire = uint64_t(retired) + 1; s.pc = pc; s.instr = bits;
+      if (decoded.rs1) s.reg_rs1 = uint32_t(state->XPR[*decoded.rs1]);
+      if (decoded.rs2 && !is_shift_imm(decoded)) s.reg_rs2 = uint32_t(state->XPR[*decoded.rs2]);
+      if (is_mem(decoded)) {
+        const uint32_t addr = uint32_t(s.reg_rs1) + sext(*decoded.imm, 12);
+        const unsigned width = decoded.type == "LW" || decoded.type == "SW" ? 4 :
+            decoded.type == "LH" || decoded.type == "LHU" || decoded.type == "SH" ? 2 : 1;
+        if (addr & (width - 1)) requires_misaligned_data_access = true;
+        s.mem_addr = addr;
+        if (is_store(decoded)) s.mem_w_data = s.reg_rs2;
+        else {
+          uint8_t data[4] = {};
+          for (unsigned i = 0; i < width; ++i) data[i] = uint8_t(*addr_to_mem(uint32_t(addr + i)));
+          // Stable observation encoding: accessed bytes in their RV32 lanes.
+          for (unsigned i = 0; i < width; ++i)
+            s.mem_r_data |= uint32_t(data[i]) << (8 * ((addr + i) & 3));
         }
       }
-    const auto decoded = decode(instr);
-    sample s;
-    s.retire = retired;
-    s.instr = instr;
-    s.pc = pc;
-    s.next_pc = pc + 4;
-    if (synthetic_nop) {
-      state->pc = pc + 4;
-      out.push_back(s);
-      continue;
-    }
-    if (decoded.rs1) s.reg_rs1 = state->XPR[*decoded.rs1];
-    if (decoded.rs2 && !is_shift_imm(decoded)) s.reg_rs2 = state->XPR[*decoded.rs2];
-    if (is_mem(decoded) && decoded.imm)
-      s.mem_addr = static_cast<uint32_t>(s.reg_rs1) + sext(*decoded.imm, 12);
-    if (is_store(decoded))
-      s.mem_w_data = s.reg_rs2;
-    if (is_load(decoded) && s.mem_addr) {
-      s.mem_r_data = data_mem.load_bus_value(decoded, static_cast<uint32_t>(*s.mem_addr));
-      if (decoded.rd && *decoded.rd != 0)
-        s.reg_rd = synthetic_load_rd_value(decoded, static_cast<uint32_t>(s.mem_r_data),
-                                           static_cast<uint32_t>(*s.mem_addr));
-    }
-    if (decoded.rd) {
-      if (*decoded.rd != 0) {
-        if (auto value = semantic_rd_value(decoded, pc, static_cast<uint32_t>(s.reg_rs1),
-                                           static_cast<uint32_t>(s.reg_rs2)))
-          s.reg_rd = *value;
+      try {
+        fetching = true;
+        const auto fetch = proc->get_mmu()->load_insn(pc);
+        fetching = false;
+        s.next_pc = uint32_t(fetch.func(proc.get(), fetch.insn, pc));
+      } catch (trap_t& trap) {
+        fetching = false;
+        throw std::runtime_error(std::string("rv32-v1 architectural trap: ") + trap.name());
       }
-    }
-
-    // Execute against the bounded sparse-memory model so arbitrary generated
-    // data addresses do not terminate replay through Spike's MMU.
-    if (decoded.rd && *decoded.rd != 0)
-      state->XPR.write(*decoded.rd, s.reg_rd);
-    if (is_store(decoded) && s.mem_addr)
-      data_mem.store(decoded, static_cast<uint32_t>(*s.mem_addr), static_cast<uint32_t>(s.reg_rs2));
-
-    reg_t next_pc = pc + 4;
-    bool remap_harness_address = false;
-    if (is_branch(decoded) && branch_taken(decoded, static_cast<uint32_t>(s.reg_rs1),
-                                           static_cast<uint32_t>(s.reg_rs2)))
-      next_pc = static_cast<uint32_t>(static_cast<uint32_t>(pc) + sext(decoded.imm.value_or(0), 13));
-    else if (decoded.type == "JAL")
-      next_pc = static_cast<uint32_t>(static_cast<uint32_t>(pc) + sext(decoded.imm.value_or(0), 21));
-    else if (decoded.type == "JALR")
-    {
-      next_pc = static_cast<uint32_t>(static_cast<uint32_t>(s.reg_rs1)
-                 + sext(decoded.imm.value_or(0), 12)) & ~uint32_t(1);
-      remap_harness_address = true;
-    }
-    state->pc = next_pc;
-    // PC-relative branches and JAL keep the same displacement after relocating
-    // the image to TEXT_BASE. Only absolute JALR targets use harness addresses
-    // and therefore need the 0x80 -> TEXT_BASE translation.
-    if (remap_harness_address && state->pc >= HARNESS_TEXT_BASE &&
-        state->pc < HARNESS_TEXT_BASE + static_cast<reg_t>(words.size() * 4)) {
-      state->pc = TEXT_BASE + (state->pc - HARNESS_TEXT_BASE);
-    }
-    s.next_pc = state->pc;
-    out.push_back(s);
+      if (s.next_pc & 3) throw std::runtime_error("Misaligned rv32-v1 control-flow target");
+      if (decoded.rd) s.reg_rd = uint32_t(state->XPR[*decoded.rd]);
+      state->pc = s.next_pc;
+      out.push_back(s);
     }
     return out;
+  }
+};
+
+struct spike_runner {
+  execution_model model = execution_model::rv32_v1;
+  std::unique_ptr<architectural_environment> architectural;
+  explicit spike_runner(const std::string& isa, execution_model = execution_model::rv32_v1)
+      : architectural(std::make_unique<architectural_environment>(isa)) {}
+  std::vector<sample> run_side(const std::vector<uint32_t>& words, int retire_count) {
+    return architectural->run(words, retire_count);
   }
 };
 
@@ -1052,6 +935,7 @@ struct case_result {
   std::map<atom, int> atoms;
   std::map<instruction_pair, int> instruction_pairs;
   std::optional<std::string> error;
+  bool requires_misaligned_data_access = false;
 };
 
 case_result run_case(const test_case& tc, spike_runner& runner, int ordinal = -1)
@@ -1060,11 +944,18 @@ case_result run_case(const test_case& tc, spike_runner& runner, int ordinal = -1
   result.ordinal = ordinal;
   result.index = tc.index;
   try {
+    if (runner.model == execution_model::rv32_v1 &&
+        (tc.max_instruction_count < 0 || tc.max_instruction_count > std::numeric_limits<int>::max() - INIT_COUNT))
+      throw std::runtime_error("Invalid rv32-v1 retirement bound");
     const int retire_count = INIT_COUNT + tc.max_instruction_count;
-    const auto left_words = words_for(tc.registers1, tc.program1, tc.max_instruction_count);
-    const auto right_words = words_for(tc.registers2, tc.program2, tc.max_instruction_count);
+    const auto left_words = words_for(tc.registers1, tc.program1, tc.max_instruction_count, runner.model);
+    const auto right_words = words_for(tc.registers2, tc.program2, tc.max_instruction_count, runner.model);
     const auto left = runner.run_side(left_words, retire_count);
+    if (runner.architectural)
+      result.requires_misaligned_data_access = runner.architectural->requires_misaligned_data_access;
     const auto right = runner.run_side(right_words, retire_count);
+    if (runner.architectural)
+      result.requires_misaligned_data_access |= runner.architectural->requires_misaligned_data_access;
     auto evidence = extract_evidence(left, right);
     result.atoms = std::move(evidence.atoms);
     result.instruction_pairs = std::move(evidence.instruction_pairs);
@@ -1119,38 +1010,46 @@ void write_instruction_pairs(std::ostream& out,
   out << "]";
 }
 
-void write_result(std::ostream& out, const case_result& result)
+void write_result(std::ostream& out, const case_result& result,
+                  execution_model model = execution_model::rv32_v1)
 {
-  out << "{\"ordinal\":" << result.ordinal
+  out << "{";
+  if (model == execution_model::rv32_v1) out << "\"execution_model\":\"rv32-v1\",";
+  out << "\"ordinal\":" << result.ordinal
       << ",\"case_index\":" << result.index << ",\"atoms\":";
   write_atoms(out, result.atoms);
   out << ",\"instruction_pairs\":";
   write_instruction_pairs(out, result.instruction_pairs);
+  if (model == execution_model::rv32_v1)
+    out << ",\"requires_misaligned_data_access\":" << (result.requires_misaligned_data_access ? "true" : "false");
   if (result.error)
     out << ",\"error\":\"" << json_escape(*result.error) << "\"";
   out << "}";
 }
 
-void write_results(std::ostream& out, const std::vector<case_result>& results)
+void write_results(std::ostream& out, const std::vector<case_result>& results,
+                   execution_model model = execution_model::rv32_v1)
 {
   size_t failed = 0;
   for (const auto& result : results)
     if (result.error) failed++;
-  out << "{\"cases\":[";
+  out << "{";
+  if (model == execution_model::rv32_v1) out << "\"execution_model\":\"rv32-v1\",";
+  out << "\"cases\":[";
   for (size_t i = 0; i < results.size(); i++) {
     if (i) out << ",";
-    write_result(out, results[i]);
+    write_result(out, results[i], model);
   }
   out << "],\"summary\":{\"total\":" << results.size()
       << ",\"failed\":" << failed << "}}\n";
 }
 
 std::string run_testcases_json(const std::string& testcases_json, const std::string& isa,
-                               int ordinal)
+                               int ordinal, execution_model model = execution_model::rv32_v1)
 {
   const auto cases = parse_testcases_json(testcases_json);
   std::vector<case_result> results;
-  spike_runner runner(isa);
+  spike_runner runner(isa, model);
   if (ordinal < 0) {
     results.reserve(cases.size());
     for (size_t i = 0; i < cases.size(); i++)
@@ -1161,7 +1060,7 @@ std::string run_testcases_json(const std::string& testcases_json, const std::str
     results.push_back(run_case(cases[ordinal], runner, ordinal));
   }
   std::ostringstream out;
-  write_results(out, results);
+  write_results(out, results, model);
   return out.str();
 }
 
@@ -1169,7 +1068,7 @@ void usage(const char* name)
 {
   std::cerr << "usage: " << name
             << " --testcases <path> (--case-index <n> | --all)"
-               " [--json-out <path>] [--isa <isa>]\n";
+               " [--json-out <path>] [--isa <isa>] \n";
 }
 
 } // namespace
@@ -1203,6 +1102,35 @@ extern "C" char* contract_spike_atoms_json(const char* testcases_json,
   }
 }
 
+extern "C" char* contract_spike_atoms_json_v2(const char* testcases_json,
+                                           const char* isa,
+                                           int ordinal, const char* execution_spec)
+{
+  try {
+    if (!testcases_json)
+      throw std::runtime_error("Missing testcase JSON input");
+    const std::string result = run_testcases_json(
+        testcases_json,
+        isa && *isa ? std::string(isa) : std::string("RV32IM_Zicclsm"),
+        ordinal, parse_execution_model(execution_spec ? execution_spec : "rv32-v1"));
+    char* out = static_cast<char*>(std::malloc(result.size() + 1));
+    if (!out)
+      return nullptr;
+    std::memcpy(out, result.c_str(), result.size() + 1);
+    return out;
+  } catch (const std::exception& e) {
+    std::ostringstream out;
+    out << "{\"cases\":[],\"summary\":{\"total\":0,\"failed\":1},\"error\":\""
+        << json_escape(e.what()) << "\"}\n";
+    const std::string result = out.str();
+    char* error = static_cast<char*>(std::malloc(result.size() + 1));
+    if (!error)
+      return nullptr;
+    std::memcpy(error, result.c_str(), result.size() + 1);
+    return error;
+  }
+}
+
 extern "C" void contract_spike_free(char* ptr)
 {
   std::free(ptr);
@@ -1215,6 +1143,7 @@ int main(int argc, char** argv)
   std::string isa = "RV32IM_Zicclsm";
   std::optional<int> case_index;
   bool all = false;
+  execution_model model = execution_model::rv32_v1;
 
   for (int i = 1; i < argc; i++) {
     const std::string arg = argv[i];
@@ -1234,6 +1163,8 @@ int main(int argc, char** argv)
         json_out_path = require_value(arg);
       } else if (arg == "--isa") {
         isa = require_value(arg);
+      } else if (arg == "--execution-model") {
+        model = parse_execution_model(require_value(arg));
       } else if (arg == "-h" || arg == "--help") {
         usage(argv[0]);
         return 0;
@@ -1255,7 +1186,7 @@ int main(int argc, char** argv)
   try {
     const auto cases = parse_testcases(testcases_path);
     std::vector<case_result> results;
-    spike_runner runner(isa);
+    spike_runner runner(isa, model);
     if (all) {
       results.reserve(cases.size());
       for (size_t i = 0; i < cases.size(); i++)
@@ -1279,10 +1210,10 @@ int main(int argc, char** argv)
     }
 
     if (!all) {
-      write_result(*out, results.front());
+      write_result(*out, results.front(), model);
       *out << "\n";
     } else {
-      write_results(*out, results);
+      write_results(*out, results, model);
     }
 
     return std::any_of(results.begin(), results.end(), [](const case_result& r) {
